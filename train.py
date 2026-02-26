@@ -31,7 +31,7 @@ import tiktoken
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=4)
+parser.add_argument("--device-batch-size", type=int, default=12)
 parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
@@ -49,7 +49,6 @@ parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
-parser.add_argument("--dropout", type=float, default=0.1)
 args = parser.parse_args()
 
 # Resolve output path
@@ -171,7 +170,6 @@ class GPTConfig:
     n_embd: int = N_EMBD
     mlp_mult: int = MLP_MULT
     window_pattern: str = WINDOW_PATTERN
-    dropout: float = 0.0
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6, bias=False):
@@ -206,7 +204,6 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, cos_sin, window_size):
         B, T, _ = x.size()
@@ -219,7 +216,7 @@ class CausalSelfAttention(nn.Module):
         k = F.rms_norm(k, (k.size(-1),))
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
-        return self.resid_dropout(self.c_proj(y))
+        return self.c_proj(y)
 
 
 class MLP(nn.Module):
@@ -228,10 +225,9 @@ class MLP(nn.Module):
         hidden_dim = config.mlp_mult * config.n_embd
         self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.resid_dropout(self.c_proj(F.relu(self.c_fc(x)).square()))
+        return self.c_proj(F.relu(self.c_fc(x)).square())
 
 
 class Block(nn.Module):
@@ -743,7 +739,6 @@ print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -761,7 +756,7 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
