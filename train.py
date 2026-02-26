@@ -36,13 +36,14 @@ parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.5)
-parser.add_argument("--matrix-lr", type=float, default=0.08)
-parser.add_argument("--weight-decay", type=float, default=1.6)
+parser.add_argument("--matrix-lr", type=float, default=0.2)
+parser.add_argument("--weight-decay", type=float, default=0.1)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n_layer", type=int, default=30)
-parser.add_argument("--n_head", type=int, default=14)
-parser.add_argument("--n_embd", type=int, default=1792)
+parser.add_argument("--n_layer", type=int, default=12)
+parser.add_argument("--n_head", type=int, default=12)
+parser.add_argument("--n_embd", type=int, default=1536)
+parser.add_argument("--mlp-mult", type=int, default=16)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
@@ -56,13 +57,14 @@ if args.output_json and not args.save_result:
     args.save_result = args.output_json
 
 # =============================================================================
-# Hardwired d12 (GPT-2 small) hyperparameters
+# Model hyperparameters
 # =============================================================================
 
-# Architecture (defaults = d12 GPT-2 small)
+# Architecture defaults
 DEPTH = args.n_layer if args.n_layer is not None else 12
-N_EMBD = args.n_embd if args.n_embd is not None else 768
-N_HEAD = args.n_head if args.n_head is not None else 6
+N_EMBD = args.n_embd if args.n_embd is not None else 1536
+N_HEAD = args.n_head if args.n_head is not None else 12
+MLP_MULT = args.mlp_mult if args.mlp_mult is not None else 16
 HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
@@ -167,15 +169,24 @@ class GPTConfig:
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
+    mlp_mult: int = MLP_MULT
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6, bias=False):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
 
-def has_ve(layer_idx, n_layer):
-    """Value Embedding on alternating layers, last layer always included."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+    def forward(self, x):
+        y = F.rms_norm(x, (self.dim,), eps=self.eps)
+        y = y * self.weight.to(dtype=y.dtype)
+        if self.bias is not None:
+            y = y + self.bias.to(dtype=y.dtype)
+        return y
 
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
@@ -184,7 +195,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -196,22 +207,16 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
+    def forward(self, x, cos_sin, window_size):
+        B, T, _ = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        # Value residual (ResFormer)
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
@@ -220,8 +225,9 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = config.mlp_mult * config.n_embd
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -229,14 +235,14 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, pre_attn_norm, pre_mlp_norm, cos_sin, window_size):
+        x = x + self.attn(pre_attn_norm(x), cos_sin, window_size)
+        x = x + self.mlp(pre_mlp_norm(x))
         return x
 
 
@@ -250,14 +256,15 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
+        self.shared_block = Block(config)
+        self.pre_attn_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
+        self.pre_mlp_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
+        self.final_norm = RMSNorm(config.n_embd, bias=True)
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -268,27 +275,24 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        block = self.shared_block
+        torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+        torch.nn.init.zeros_(block.attn.c_proj.weight)
+        torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+        torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        for rmsnorm in list(self.pre_attn_norms) + list(self.pre_mlp_norms) + [self.final_norm]:
+            torch.nn.init.ones_(rmsnorm.weight)
+            if rmsnorm.bias is not None:
+                torch.nn.init.zeros_(rmsnorm.bias)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
         device = self.transformer.wte.weight.device
@@ -310,17 +314,17 @@ class GPT(nn.Module):
         return self.transformer.wte.weight.device
 
     def estimate_flops(self):
-        nparams = sum(p.numel() for p in self.parameters())
-        ve_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        shared_block_params = sum(p.numel() for p in self.shared_block.parameters() if p.ndim >= 2)
+        effective_block_params = shared_block_params * self.config.n_layer
+        out_params = self.lm_head.weight.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
-        return 6 * (nparams - nparams_exclude) + attn_flops
+        return 6 * (effective_block_params + out_params) + attn_flops
 
     def setup_optimizer(self):
-        ddp, rank, local_rank, world_size = get_dist_info()
-        matrix_params = list(self.transformer.h.parameters())
-        ve_params = list(self.value_embeds.parameters())
+        ddp, _, _, _ = get_dist_info()
+        matrix_params = [p for p in self.shared_block.parameters() if p.ndim >= 2]
+        norm_params = list(self.pre_attn_norms.parameters()) + list(self.pre_mlp_norms.parameters()) + list(self.final_norm.parameters())
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -329,7 +333,7 @@ class GPT(nn.Module):
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=norm_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
@@ -347,13 +351,12 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+        x = F.rms_norm(self.transformer.wte(idx), (self.config.n_embd,))
         x0 = x
-        for i, block in enumerate(self.transformer.h):
+        for i in range(self.config.n_layer):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
+            x = self.shared_block(x, self.pre_attn_norms[i], self.pre_mlp_norms[i], cos_sin, self.window_sizes[i])
+        x = self.final_norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
@@ -733,6 +736,7 @@ if master_process:
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
+print0(f"  mlp_mult={MLP_MULT}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
@@ -764,12 +768,24 @@ model.to_empty(device=device)
 model.init_weights()
 
 param_counts = sum(p.numel() for p in model.parameters())
-transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
-ve_params = sum(p.numel() for p in model.value_embeds.parameters())
+shared_block_params = sum(p.numel() for p in model.shared_block.parameters())
+effective_block_params = shared_block_params * config.n_layer
+norm_params = (
+    sum(p.numel() for p in model.pre_attn_norms.parameters())
+    + sum(p.numel() for p in model.pre_mlp_norms.parameters())
+    + sum(p.numel() for p in model.final_norm.parameters())
+)
+embed_params = sum(p.numel() for p in model.transformer.wte.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
-other_params = param_counts - transformer_params - ve_params - lm_head_params
+residual_mixer_params = model.resid_lambdas.numel() + model.x0_lambdas.numel()
+other_params = param_counts - shared_block_params - norm_params - embed_params - lm_head_params - residual_mixer_params
 num_flops_per_token = model.estimate_flops()
-print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+print0(
+    f"Parameters: {param_counts:,} (shared_block: {shared_block_params:,}, "
+    f"effective_repeated_block: {effective_block_params:,}, norms: {norm_params:,}, "
+    f"embedding: {embed_params:,}, lm_head: {lm_head_params:,}, "
+    f"residual_mixers: {residual_mixer_params:,}, other: {other_params:,})"
+)
 print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
@@ -929,4 +945,3 @@ if args.save_result and master_process:
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
