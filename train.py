@@ -42,7 +42,7 @@ parser.add_argument("--muon-weight-decay", type=float, default=0.1)
 parser.add_argument("--total-batch-size", type=int, default=131072)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
-parser.add_argument("--n_head", type=int, default=12)
+parser.add_argument("--n_head", type=int, default=16)
 parser.add_argument("--n_embd", type=int, default=2048)
 parser.add_argument("--mlp-mult", type=int, default=16)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
@@ -66,7 +66,7 @@ N_EMBD = args.n_embd if args.n_embd is not None else 1536
 N_HEAD = args.n_head if args.n_head is not None else 12
 MLP_MULT = args.mlp_mult if args.mlp_mult is not None else 16
 HEAD_DIM = N_EMBD // N_HEAD
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1024
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
