@@ -31,7 +31,7 @@ import tiktoken
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=8)
+parser.add_argument("--device-batch-size", type=int, default=6)
 parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
@@ -39,7 +39,7 @@ parser.add_argument("--scalar-lr", type=float, default=0.5)
 parser.add_argument("--matrix-lr", type=float, default=0.2)
 parser.add_argument("--adam-weight-decay", type=float, default=0.005)
 parser.add_argument("--muon-weight-decay", type=float, default=0.1)
-parser.add_argument("--total-batch-size", type=int, default=131072)
+parser.add_argument("--total-batch-size", type=int, default=98304)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=24)
 parser.add_argument("--n_head", type=int, default=16)
