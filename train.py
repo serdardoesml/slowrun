@@ -645,6 +645,13 @@ class DataLoader:
         self.device = device
         self.pos = 0
         self.epoch = 1
+        self.shuffle_gen = torch.Generator(device="cpu")
+        self.shuffle_gen.manual_seed(0)
+        self._shuffle_epoch_data()
+
+    def _shuffle_epoch_data(self):
+        perm = torch.randperm(self.num_steps, generator=self.shuffle_gen)
+        self.rank_data = self.rank_data[perm].contiguous()
 
     def __iter__(self):
         return self
@@ -653,6 +660,7 @@ class DataLoader:
         if self.pos >= self.num_steps:
             self.pos = 0
             self.epoch += 1
+            self._shuffle_epoch_data()
             print0(f"Starting epoch {self.epoch}")
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
