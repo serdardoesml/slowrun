@@ -31,18 +31,19 @@ import tiktoken
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=12)
+parser.add_argument("--device-batch-size", type=int, default=8)
 parser.add_argument("--num-epochs", type=int, default=12)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
-parser.add_argument("--scalar-lr", type=float, default=0.2)
+parser.add_argument("--scalar-lr", type=float, default=0.5)
 parser.add_argument("--matrix-lr", type=float, default=0.2)
-parser.add_argument("--weight-decay", type=float, default=0.1)
-parser.add_argument("--total-batch-size", type=int, default=98304)
+parser.add_argument("--adam-weight-decay", type=float, default=0.005)
+parser.add_argument("--muon-weight-decay", type=float, default=0.1)
+parser.add_argument("--total-batch-size", type=int, default=131072)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=12)
 parser.add_argument("--n_head", type=int, default=12)
-parser.add_argument("--n_embd", type=int, default=1536)
+parser.add_argument("--n_embd", type=int, default=2048)
 parser.add_argument("--mlp-mult", type=int, default=16)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
@@ -84,7 +85,8 @@ UNEMBEDDING_LR = BASE_UNEMBEDDING_LR * _lr_mult
 EMBEDDING_LR = BASE_EMBEDDING_LR * _lr_mult
 SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 
-WEIGHT_DECAY = args.weight_decay
+ADAM_WEIGHT_DECAY = args.adam_weight_decay
+MUON_WEIGHT_DECAY = args.muon_weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
@@ -250,9 +252,7 @@ class GPT(nn.Module):
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(padded_vocab, config.n_embd),
-        })
+        self.wte = nn.Embedding(padded_vocab, config.n_embd)
         self.shared_block = Block(config)
         self.pre_attn_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
         self.pre_mlp_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
@@ -268,7 +268,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
         block = self.shared_block
@@ -287,11 +287,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        if self.transformer.wte.weight.device.type == "cuda":
-            self.transformer.wte.to(dtype=torch.bfloat16)
+        if self.wte.weight.device.type == "cuda":
+            self.wte.to(dtype=torch.bfloat16)
 
     def _precompute_rotary(self, seq_len, head_dim, base=10000):
-        device = self.transformer.wte.weight.device
+        device = self.wte.weight.device
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
@@ -307,7 +307,7 @@ class GPT(nn.Module):
         return sizes
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        return self.wte.weight.device
 
     def estimate_flops(self):
         shared_block_params = sum(p.numel() for p in self.shared_block.parameters() if p.ndim >= 2)
@@ -321,22 +321,22 @@ class GPT(nn.Module):
         ddp, _, _, _ = get_dist_info()
         matrix_params = [p for p in self.shared_block.parameters() if p.ndim >= 2]
         norm_params = list(self.pre_attn_norms.parameters()) + list(self.pre_mlp_norms.parameters()) + list(self.final_norm.parameters())
-        embed_params = list(self.transformer.wte.parameters())
+        embed_params = list(self.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
 
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=norm_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=ADAM_WEIGHT_DECAY),
+            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=ADAM_WEIGHT_DECAY),
+            dict(kind='adamw', params=norm_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
-                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=MUON_WEIGHT_DECAY))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
@@ -347,7 +347,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = F.rms_norm(self.transformer.wte(idx), (self.config.n_embd,))
+        x = F.rms_norm(self.wte(idx), (self.config.n_embd,))
         x0 = x
         for i in range(self.config.n_layer):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -736,7 +736,7 @@ print0(f"  mlp_mult={MLP_MULT}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
-print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
+print0(f"  adam_weight_decay={ADAM_WEIGHT_DECAY}, muon_weight_decay={MUON_WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"-----------------------")
@@ -770,7 +770,7 @@ norm_params = (
     + sum(p.numel() for p in model.pre_mlp_norms.parameters())
     + sum(p.numel() for p in model.final_norm.parameters())
 )
-embed_params = sum(p.numel() for p in model.transformer.wte.parameters())
+embed_params = sum(p.numel() for p in model.wte.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 residual_mixer_params = model.resid_lambdas.numel() + model.x0_lambdas.numel()
 other_params = param_counts - shared_block_params - norm_params - embed_params - lm_head_params - residual_mixer_params
@@ -927,7 +927,8 @@ wandb_run.summary["best_val_loss"] = min_val_loss
 if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
-        "weight_decay": args.weight_decay,
+        "adam_weight_decay": args.adam_weight_decay,
+        "muon_weight_decay": args.muon_weight_decay,
         "num_epochs": args.num_epochs,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
