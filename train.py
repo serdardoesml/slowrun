@@ -43,7 +43,8 @@ parser.add_argument("--total-batch-size", type=int, default=131072)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=16)
-parser.add_argument("--n_embd", type=int, default=2048)
+parser.add_argument("--n_hidden", type=int, default=2048)
+parser.add_argument("--n_wembed", type=int, default=512)
 parser.add_argument("--mlp-mult", type=int, default=16)
 parser.add_argument("--lr_multiplier", type=float, default=0.25)
 parser.add_argument("--input_bin", type=str, default=None)
@@ -62,10 +63,11 @@ if args.output_json and not args.save_result:
 
 # Architecture defaults
 DEPTH = args.n_layer if args.n_layer is not None else 12
-N_EMBD = args.n_embd if args.n_embd is not None else 1536
+N_HIDDEN = args.n_hidden if args.n_hidden is not None else 1536
+N_WEMBED = args.n_wembed if args.n_wembed is not None else 768
 N_HEAD = args.n_head if args.n_head is not None else 12
 MLP_MULT = args.mlp_mult if args.mlp_mult is not None else 16
-HEAD_DIM = N_EMBD // N_HEAD
+HEAD_DIM = N_HIDDEN // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
@@ -169,7 +171,8 @@ class GPTConfig:
     n_layer: int = DEPTH
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
-    n_embd: int = N_EMBD
+    n_hidden: int = N_HIDDEN
+    n_wembed: int = N_WEMBED
     mlp_mult: int = MLP_MULT
     window_pattern: str = WINDOW_PATTERN
 
@@ -199,13 +202,13 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.n_hidden = config.n_hidden
+        self.head_dim = self.n_hidden // self.n_head
+        assert self.n_hidden % self.n_head == 0
+        self.c_q = nn.Linear(self.n_hidden, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_hidden, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_hidden, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_hidden, self.n_hidden, bias=False)
 
     def forward(self, x, cos_sin, window_size):
         B, T, _ = x.size()
@@ -224,9 +227,9 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = config.mlp_mult * config.n_embd
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        hidden_dim = config.mlp_mult * config.n_hidden
+        self.c_fc = nn.Linear(config.n_hidden, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_hidden, bias=False)
 
     def forward(self, x):
         return self.c_proj(F.relu(self.c_fc(x)).square())
@@ -252,15 +255,17 @@ class GPT(nn.Module):
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
-        self.wte = nn.Embedding(padded_vocab, config.n_embd)
+        self.wte = nn.Embedding(padded_vocab, config.n_wembed)
+        self.wte_proj = nn.Linear(config.n_wembed, config.n_hidden, bias=False)
         self.shared_block = Block(config)
-        self.pre_attn_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
-        self.pre_mlp_norms = nn.ModuleList([RMSNorm(config.n_embd, bias=True) for _ in range(config.n_layer)])
-        self.final_norm = RMSNorm(config.n_embd, bias=True)
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.pre_attn_norms = nn.ModuleList([RMSNorm(config.n_hidden, bias=True) for _ in range(config.n_layer)])
+        self.pre_mlp_norms = nn.ModuleList([RMSNorm(config.n_hidden, bias=True) for _ in range(config.n_layer)])
+        self.final_norm = RMSNorm(config.n_hidden, bias=True)
+        self.lm_head_proj = nn.Linear(config.n_hidden, config.n_wembed, bias=False)
+        self.lm_head = nn.Linear(config.n_wembed, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        head_dim = config.n_embd // config.n_head
+        head_dim = config.n_hidden // config.n_head
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -269,8 +274,10 @@ class GPT(nn.Module):
     @torch.no_grad()
     def init_weights(self):
         torch.nn.init.normal_(self.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.uniform_(self.wte_proj.weight, -0.02, 0.02)
+        torch.nn.init.uniform_(self.lm_head_proj.weight, -0.02, 0.02)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        s = 3**0.5 * self.config.n_embd**-0.5
+        s = 3**0.5 * self.config.n_hidden**-0.5
         block = self.shared_block
         torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
         torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
@@ -284,7 +291,7 @@ class GPT(nn.Module):
             torch.nn.init.ones_(rmsnorm.weight)
             if rmsnorm.bias is not None:
                 torch.nn.init.zeros_(rmsnorm.bias)
-        head_dim = self.config.n_embd // self.config.n_head
+        head_dim = self.config.n_hidden // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         if self.wte.weight.device.type == "cuda":
@@ -312,8 +319,8 @@ class GPT(nn.Module):
     def estimate_flops(self):
         shared_block_params = sum(p.numel() for p in self.shared_block.parameters() if p.ndim >= 2)
         effective_block_params = shared_block_params * self.config.n_layer
-        out_params = self.lm_head.weight.numel()
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        out_params = self.lm_head_proj.weight.numel() + self.lm_head.weight.numel()
+        h, q, t = self.config.n_head, self.config.n_hidden // self.config.n_head, self.config.sequence_len
         attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
         return 6 * (effective_block_params + out_params) + attn_flops
 
@@ -321,8 +328,8 @@ class GPT(nn.Module):
         ddp, _, _, _ = get_dist_info()
         matrix_params = [p for p in self.shared_block.parameters() if p.ndim >= 2]
         norm_params = list(self.pre_attn_norms.parameters()) + list(self.pre_mlp_norms.parameters()) + list(self.final_norm.parameters())
-        embed_params = list(self.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        embed_params = list(self.wte.parameters()) + list(self.wte_proj.parameters())
+        lm_head_params = list(self.lm_head_proj.parameters()) + list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
 
@@ -345,15 +352,16 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
-        B, T = idx.size()
+        _, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = F.rms_norm(self.wte(idx), (self.config.n_embd,))
+        x = self.wte_proj(self.wte(idx))
+        x = F.rms_norm(x, (self.config.n_hidden,))
         x0 = x
         for i in range(self.config.n_layer):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = self.shared_block(x, self.pre_attn_norms[i], self.pre_mlp_norms[i], cos_sin, self.window_sizes[i])
         x = self.final_norm(x)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+        logits = self.lm_head(self.lm_head_proj(x))[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
             return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
@@ -731,7 +739,7 @@ if master_process:
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
-print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
+print0(f"  n_layer={DEPTH}, n_hidden={N_HIDDEN}, n_wembed={N_WEMBED}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  mlp_mult={MLP_MULT}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
@@ -771,14 +779,20 @@ norm_params = (
     + sum(p.numel() for p in model.final_norm.parameters())
 )
 embed_params = sum(p.numel() for p in model.wte.parameters())
+embed_proj_params = sum(p.numel() for p in model.wte_proj.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
+lm_head_proj_params = sum(p.numel() for p in model.lm_head_proj.parameters())
 residual_mixer_params = model.resid_lambdas.numel() + model.x0_lambdas.numel()
-other_params = param_counts - shared_block_params - norm_params - embed_params - lm_head_params - residual_mixer_params
+other_params = (
+    param_counts - shared_block_params - norm_params - embed_params - embed_proj_params
+    - lm_head_params - lm_head_proj_params - residual_mixer_params
+)
 num_flops_per_token = model.estimate_flops()
 print0(
     f"Parameters: {param_counts:,} (shared_block: {shared_block_params:,}, "
     f"effective_repeated_block: {effective_block_params:,}, norms: {norm_params:,}, "
-    f"embedding: {embed_params:,}, lm_head: {lm_head_params:,}, "
+    f"embedding: {embed_params:,}, embed_proj: {embed_proj_params:,}, "
+    f"lm_head_proj: {lm_head_proj_params:,}, lm_head: {lm_head_params:,}, "
     f"residual_mixers: {residual_mixer_params:,}, other: {other_params:,})"
 )
 print0(f"FLOPs per token: {num_flops_per_token:e}")
