@@ -53,6 +53,8 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 3 | 3.395 | Add U-Net architecture | 03/03/26 | 14.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0e6280bb7f3673cf84e46a9b7cf7818b24511ed6/tiny/train.py) | [@em-see-squared](https://github.com/em-see-squared), [@akshayvegesna](https://x.com/akshayvegesna)
 4 | 3.385 | Add gating per attention head | 03/04/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/781d005e8e99a8af0ee9ab356a4c543778730f6b/tiny/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 5 | 3.383 | Update warmdown ratio | 03/06/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/56559aa8526708c107e1e28eb8fc4a1721bd9c67/tiny/train.py) | [@not-nonymous](https://github.com/not-nonymous)
+6 | 3.374 | Half truncated RoPE, partial key offset, residual lambdas to 1.1 | 03/06/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/ed62160275273197c3a996c4469d735a05c5eedb/tiny/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
+
 
 
 
