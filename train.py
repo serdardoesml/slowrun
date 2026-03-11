@@ -346,42 +346,54 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+        """Run decoder layers [start, end), with U-Net skip connections."""
+        for i in range(start, end):
+            # Encoder layer j connects to decoder layer (n_layer - 1 - j)
+            j = self.config.n_layer - 1 - i
+            if 0 <= j < self.encoder_layers:
+                x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+        return x
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
-        skip_connections = []
-        skip_snapshot = None
-        dupe = self._dupe_layers
 
-        for i, block in enumerate(self.transformer.h):
-            # Save skip stack snapshot right before first decoder layer
-            if dupe is not None and i == self.encoder_layers and skip_snapshot is None:
-                skip_snapshot = list(skip_connections)
-            if i >= self.encoder_layers and skip_connections:
-                skip = skip_connections.pop()
-                x = x + self.skip_weights[i - self.encoder_layers] * skip
+        # Encoder half: run layers and collect outputs for skip connections
+        encoder_outputs = []
+        for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-            if i < self.encoder_layers:
-                skip_connections.append(x)
-            # After last dupe layer on first pass: run repeat with restored skips
-            if dupe is not None and i == dupe[1] - 1:
-                skip_connections = list(skip_snapshot)
-                for j in range(dupe[0], dupe[1]):
-                    skip = skip_connections.pop()
-                    x = x + self.skip_weights[j - self.encoder_layers] * skip
-                    x = self.resid_lambdas[j] * x + self.x0_lambdas[j] * x0
-                    ve = self.ve_projs[str(j)](x0) if str(j) in self.ve_projs else None
-                    x = self.transformer.h[j](x, ve, cos_sin, self.window_sizes[j])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            encoder_outputs.append(x)
+
+        # Decoder half
+        dupe = self._dupe_layers
+        if dupe is None:
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer)
+        else:
+            # First pass: encoder boundary through end of dupe range
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        self.encoder_layers, dupe[1])
+            # Replay: run dupe range again with same skip connections
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[0], dupe[1])
+            # Remaining decoder layers
+            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+                                        dupe[1], self.config.n_layer)
 
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # softcap
+        logits = 15 * torch.tanh(logits / 15)
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                ignore_index=-1, reduction=loss_reduction)
         return logits
 
 # =============================================================================
