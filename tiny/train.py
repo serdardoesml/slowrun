@@ -50,13 +50,13 @@ parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
-parser.add_argument("--n_fembd", type=int, default=384)
+parser.add_argument("--n_fembd", type=int, default=512)
 parser.add_argument("--lr_multiplier", type=float, default=1.0)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
-parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--dropout", type=float, default=0.0)
 args = parser.parse_args()
 
 # Resolve output path
@@ -211,10 +211,7 @@ class CausalSelfAttention(nn.Module):
         # Per-head attention gate: enables context-based attention no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        # Determine if this is a long-window layer for partial key offset
-        pattern = config.window_pattern.upper()
-        char = pattern[layer_idx % len(pattern)]
-        self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
+        self.long_window = config.sequence_len
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -230,7 +227,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         # Partial key offset: shift stationary dims forward by 1 on long-window layers
-        if self.use_key_offset and T > 1:
+        if window_size[0] == self.long_window and T > 1:
             k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
@@ -273,9 +270,10 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
         self.embed_up = nn.Identity() if config.n_fembd == config.n_embd else nn.Linear(config.n_fembd, config.n_embd, bias=False)
         self.lm_head_down = nn.Identity() if config.n_fembd == config.n_embd else nn.Linear(config.n_embd, config.n_fembd, bias=False)
+        self.n_unique_blocks = min(4, config.n_layer)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_fembd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i) for i in range(self.n_unique_blocks)]),
         })
         self.lm_head = nn.Linear(config.n_fembd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -392,7 +390,8 @@ class GPT(nn.Module):
         x = norm(self.embed_up(self.transformer.wte(idx)))
         x0 = x
         skip_connections = []
-        for i, block in enumerate(self.transformer.h):
+        for i in range(self.config.n_layer):
+            block = self.transformer.h[i % self.n_unique_blocks]
             if i >= self.encoder_layers and skip_connections:
                 skip = skip_connections.pop()
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
@@ -757,11 +756,17 @@ model.init_weights()
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
+effective_transformer_params = sum(
+    len(range(i, model.config.n_layer, model.n_unique_blocks)) * sum(p.numel() for p in block.parameters())
+    for i, block in enumerate(model.transformer.h)
+)
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
 other_params = param_counts - transformer_params - ve_params - lm_head_params
+effective_param_counts = param_counts - transformer_params + effective_transformer_params
 num_flops_per_token = model.estimate_flops()
-print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+print0(f"Parameters (unique): {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+print0(f"Parameters (effective): {effective_param_counts:,} (transformer: {effective_transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
