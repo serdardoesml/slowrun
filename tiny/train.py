@@ -43,14 +43,14 @@ parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
-parser.add_argument("--weight-decay", type=float, default=0.8)
+parser.add_argument("--weight-decay", type=float, default=0.1)
 parser.add_argument("--warmdown-ratio", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
-parser.add_argument("--n_fembd", type=int, default=512)
+parser.add_argument("--n_fembd", type=int, default=384)
 parser.add_argument("--lr_multiplier", type=float, default=1.0)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
@@ -360,10 +360,10 @@ class GPT(nn.Module):
         # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
-        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
+        all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters()) + list(self.embed_up.parameters()) + list(self.lm_head_down.parameters())
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
-        embed_params = list(self.transformer.wte.parameters()) + list(self.embed_up.parameters())
-        lm_head_params = list(self.lm_head_down.parameters()) + list(self.lm_head.parameters())
+        embed_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
