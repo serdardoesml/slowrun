@@ -50,6 +50,7 @@ parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
+parser.add_argument("--n_fembd", type=int, default=512)
 parser.add_argument("--lr_multiplier", type=float, default=1.0)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
@@ -69,6 +70,7 @@ if args.output_json and not args.save_result:
 # Architecture
 DEPTH = args.n_layer if args.n_layer is not None else 12
 N_EMBD = args.n_embd if args.n_embd is not None else 768
+N_FEMBD = args.n_fembd if args.n_fembd is not None else 512
 N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
@@ -174,6 +176,7 @@ class GPTConfig:
     n_head: int = N_HEAD
     n_kv_head: int = N_HEAD
     n_embd: int = N_EMBD
+    n_fembd: int = N_FEMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1         
 
@@ -268,11 +271,13 @@ class GPT(nn.Module):
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
+        self.embed_up = nn.Identity() if config.n_fembd == config.n_embd else nn.Linear(config.n_fembd, config.n_embd, bias=False)
+        self.lm_head_down = nn.Identity() if config.n_fembd == config.n_embd else nn.Linear(config.n_embd, config.n_fembd, bias=False)
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(padded_vocab, config.n_embd),
+            "wte": nn.Embedding(padded_vocab, config.n_fembd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.lm_head = nn.Linear(config.n_fembd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
@@ -290,6 +295,10 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if isinstance(self.embed_up, nn.Linear):
+            torch.nn.init.normal_(self.embed_up.weight, mean=0.0, std=1.0)
+        if isinstance(self.lm_head_down, nn.Linear):
+            torch.nn.init.normal_(self.lm_head_down.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -353,8 +362,8 @@ class GPT(nn.Module):
         attn_gate_ids = {id(p) for p in attn_gate_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
-        embed_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        embed_params = list(self.transformer.wte.parameters()) + list(self.embed_up.parameters())
+        lm_head_params = list(self.lm_head_down.parameters()) + list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
@@ -380,7 +389,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
-        x = norm(self.transformer.wte(idx))
+        x = norm(self.embed_up(self.transformer.wte(idx)))
         x0 = x
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
@@ -393,7 +402,7 @@ class GPT(nn.Module):
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+        logits = self.lm_head(self.lm_head_down(x))[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
             return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
@@ -715,7 +724,7 @@ if master_process:
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
-print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
+print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_fembd={N_FEMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
