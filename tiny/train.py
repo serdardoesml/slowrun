@@ -113,7 +113,7 @@ SYNTHETIC_WARMUP_STEPS = 2000
 SYNTHETIC_NUM_MOTIFS = 32
 SYNTHETIC_MOTIF_LEN = 8
 SYNTHETIC_MOTIF_LEN_JITTER = 4
-SYNTHETIC_EARLY_EXIT_LOSS = 0.01
+SYNTHETIC_EARLY_EXIT_LOSS = 0.07
 
 # =============================================================================
 # Utilities
