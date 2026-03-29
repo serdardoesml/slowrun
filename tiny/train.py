@@ -105,7 +105,13 @@ WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
+
 FINAL_LR_FRAC = 0.0
+
+# Synthetic pre-pretraining warmup
+SYNTHETIC_WARMUP_STEPS = 1000
+SYNTHETIC_NUM_MOTIFS = 4
+SYNTHETIC_MOTIF_LEN = 64
 
 # =============================================================================
 # Utilities
@@ -655,6 +661,43 @@ class DataLoader:
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
 
+
+
+def make_synthetic_batch(B, T, vocab_size, device, num_motifs=SYNTHETIC_NUM_MOTIFS,
+                         motif_len=SYNTHETIC_MOTIF_LEN):
+    """Create a batch where an initial motif block is repeated in different orders to fill the full context.
+    Loss is masked on the first presentation so only repeated regions train the model.
+    """
+    x = torch.empty(B, T, device=device, dtype=torch.long)
+    y = torch.full((B, T), -1, device=device, dtype=torch.long)
+
+    motif_block_len = num_motifs * motif_len
+    assert motif_block_len + 1 <= T, f"Synthetic layout needs at least {motif_block_len + 1} tokens, got T={T}"
+
+    num_blocks = math.ceil(T / motif_block_len)
+
+    for b in range(B):
+        motifs = torch.randint(0, vocab_size, (num_motifs, motif_len), device=device, dtype=torch.long)
+        blocks = []
+        first_order = torch.randperm(num_motifs, device=device)
+        prev_order = first_order
+        blocks.append(motifs[first_order].reshape(-1))
+        for _ in range(1, num_blocks):
+            order = torch.randperm(num_motifs, device=device)
+            while torch.equal(order, prev_order):
+                order = torch.randperm(num_motifs, device=device)
+            blocks.append(motifs[order].reshape(-1))
+            prev_order = order
+
+        seq = torch.cat(blocks, dim=0)[:T]
+        x[b] = seq
+
+        # Standard next-token targets, but only supervise tokens after the first full motif block.
+        y[b, :-1] = seq[1:]
+        y[b, :motif_block_len] = -1
+
+    return x, y
+
 # =============================================================================
 # Loss evaluation
 # =============================================================================
@@ -828,6 +871,36 @@ steps_per_epoch = num_iterations / args.num_epochs
 param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_epoch) if args.update_ema_every > 0 else 0
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
+# Synthetic pre-pretraining warmup (excluded from main step count and main metrics)
+if SYNTHETIC_WARMUP_STEPS > 0:
+    print0(f"Starting synthetic warmup for {SYNTHETIC_WARMUP_STEPS} steps")
+    model.train()
+    for warmup_step in range(SYNTHETIC_WARMUP_STEPS):
+        synchronize()
+        t0 = time.time()
+        for micro_step in range(grad_accum_steps):
+            x_syn, y_syn = make_synthetic_batch(args.device_batch_size, MAX_SEQ_LEN, vocab_size, device)
+            with autocast_ctx:
+                loss = model(x_syn, y_syn)
+            warmup_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"]
+            if "initial_wd" not in group:
+                group["initial_wd"] = group.get("weight_decay", 0.0)
+            group["weight_decay"] = group["initial_wd"]
+            if group['kind'] == 'muon':
+                group["momentum"] = 0.95
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        synchronize()
+        dt = time.time() - t0
+        if (warmup_step + 1) % 50 == 0 or warmup_step == 0:
+            print0(f"synthetic warmup {warmup_step + 1:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss.item():.6f} | dt: {dt*1000:.2f}ms")
+        if master_process:
+            wandb_run.log({"synth-train/loss": warmup_loss.item(), "synth-train/step": warmup_step + 1})
+    print0("Finished synthetic warmup")
+
 wall_clock_start = time.time()
 
 # Initial val evaluation
@@ -893,7 +966,7 @@ while current_epoch <= args.num_epochs:
     steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu, "train/fineweb_step": step})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
