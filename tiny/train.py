@@ -110,8 +110,8 @@ FINAL_LR_FRAC = 0.0
 
 # Synthetic pre-pretraining warmup
 SYNTHETIC_WARMUP_STEPS = 1000
-SYNTHETIC_NUM_MOTIFS = 4
-SYNTHETIC_MOTIF_LEN = 64
+SYNTHETIC_NUM_MOTIFS = 64
+SYNTHETIC_MOTIF_LEN = 4
 
 # =============================================================================
 # Utilities
