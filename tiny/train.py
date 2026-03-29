@@ -112,6 +112,7 @@ FINAL_LR_FRAC = 0.0
 SYNTHETIC_WARMUP_STEPS = 2000
 SYNTHETIC_NUM_MOTIFS = 32
 SYNTHETIC_MOTIF_LEN = 8
+SYNTHETIC_EARLY_EXIT_LOSS = 1.5
 
 # =============================================================================
 # Utilities
@@ -907,7 +908,7 @@ if SYNTHETIC_WARMUP_STEPS > 0:
             print0(f"synth step {synth_step:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss.item():.6f} | dt: {dt*1000:.2f}ms")
         if master_process:
             wandb_run.log({"synth_step": synth_step, "synth-train/loss": warmup_loss.item()})
-        if warmup_loss.item() < 1.0:
+        if warmup_loss.item() < SYNTHETIC_EARLY_EXIT_LOSS:
             print0(f"Ending synthetic warmup early at synth step {synth_step:04d} | loss: {warmup_loss.item():.6f}")
             break
     print0("Finished synthetic warmup")
