@@ -109,9 +109,9 @@ WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
 
 # Synthetic pre-pretraining warmup
-SYNTHETIC_WARMUP_STEPS = 1000
-SYNTHETIC_NUM_MOTIFS = 64
-SYNTHETIC_MOTIF_LEN = 4
+SYNTHETIC_WARMUP_STEPS = 2000
+SYNTHETIC_NUM_MOTIFS = 32
+SYNTHETIC_MOTIF_LEN = 8
 
 # =============================================================================
 # Utilities
@@ -776,6 +776,11 @@ if args.wandb_group:
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
 if master_process:
     wandb_run.log_code(".")
+    wandb_run.define_metric("synth_step")
+    wandb_run.define_metric("synth-train/*", step_metric="synth_step")
+    wandb_run.define_metric("step")
+    wandb_run.define_metric("train/*", step_metric="step")
+    wandb_run.define_metric("val/*", step_metric="step")
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
@@ -861,6 +866,7 @@ def get_muon_momentum(it):
 
 # Training loop
 step = 0
+synth_step = 0
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
@@ -876,6 +882,7 @@ if SYNTHETIC_WARMUP_STEPS > 0:
     print0(f"Starting synthetic warmup for {SYNTHETIC_WARMUP_STEPS} steps")
     model.train()
     for warmup_step in range(SYNTHETIC_WARMUP_STEPS):
+        synth_step = warmup_step + 1
         synchronize()
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
@@ -895,10 +902,10 @@ if SYNTHETIC_WARMUP_STEPS > 0:
         model.zero_grad(set_to_none=True)
         synchronize()
         dt = time.time() - t0
-        if (warmup_step + 1) % 50 == 0 or warmup_step == 0:
-            print0(f"synthetic warmup {warmup_step + 1:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss.item():.6f} | dt: {dt*1000:.2f}ms")
+        if synth_step % 50 == 0 or warmup_step == 0:
+            print0(f"synth step {synth_step:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss.item():.6f} | dt: {dt*1000:.2f}ms")
         if master_process:
-            wandb_run.log({"synth-train/loss": warmup_loss.item(), "synth-train/step": warmup_step + 1})
+            wandb_run.log({"synth_step": synth_step, "synth-train/loss": warmup_loss.item()})
     print0("Finished synthetic warmup")
 
 wall_clock_start = time.time()
@@ -1030,12 +1037,16 @@ print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
+wandb_run.summary["synth_steps"] = synth_step
+wandb_run.summary["fineweb_steps"] = step
 
 if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "synth_steps": synth_step,
+        "fineweb_steps": step,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
