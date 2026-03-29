@@ -738,12 +738,13 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 master_process = ddp_rank == 0
-torch.manual_seed(42)
+seed = 42 + ddp_rank
+torch.manual_seed(seed)
 
 if ddp and torch.cuda.is_available():
     device = torch.device("cuda", ddp_local_rank)
     torch.cuda.set_device(device)
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(seed)
     dist.init_process_group(backend="nccl", device_id=device)
     dist.barrier()
 else:
