@@ -112,7 +112,8 @@ FINAL_LR_FRAC = 0.0
 SYNTHETIC_WARMUP_STEPS = 2000
 SYNTHETIC_NUM_MOTIFS = 32
 SYNTHETIC_MOTIF_LEN = 8
-SYNTHETIC_EARLY_EXIT_LOSS = 1.5
+SYNTHETIC_MOTIF_LEN_JITTER = 4
+SYNTHETIC_EARLY_EXIT_LOSS = 0.01
 
 # =============================================================================
 # Utilities
@@ -665,37 +666,56 @@ class DataLoader:
 
 
 def make_synthetic_batch(B, T, vocab_size, device, num_motifs=SYNTHETIC_NUM_MOTIFS,
-                         motif_len=SYNTHETIC_MOTIF_LEN):
+                         motif_len=SYNTHETIC_MOTIF_LEN, motif_len_jitter=SYNTHETIC_MOTIF_LEN_JITTER):
     """Create a batch where an initial motif block is repeated in different orders to fill the full context.
-    Loss is masked on the first presentation so only repeated regions train the model.
+    Loss is masked on the first presentation and at motif boundaries so only repeated
+    within-motif continuations train the model.
     """
     x = torch.empty(B, T, device=device, dtype=torch.long)
     y = torch.full((B, T), -1, device=device, dtype=torch.long)
 
-    motif_block_len = num_motifs * motif_len
-    assert motif_block_len + 1 <= T, f"Synthetic layout needs at least {motif_block_len + 1} tokens, got T={T}"
-
-    num_blocks = math.ceil(T / motif_block_len)
+    min_motif_len = max(1, motif_len - motif_len_jitter)
+    max_motif_len = motif_len + motif_len_jitter
 
     for b in range(B):
-        motifs = torch.randint(0, vocab_size, (num_motifs, motif_len), device=device, dtype=torch.long)
+        motif_lengths = torch.randint(min_motif_len, max_motif_len + 1, (num_motifs,))
+        motif_block_len = int(motif_lengths.sum().item())
+        assert motif_block_len + 1 <= T, f"Synthetic layout needs at least {motif_block_len + 1} tokens, got T={T}"
+        num_blocks = math.ceil(T / motif_block_len)
+        motifs = [
+            torch.randint(0, vocab_size, (motif_len_i,), device=device, dtype=torch.long)
+            for motif_len_i in motif_lengths.tolist()
+        ]
         blocks = []
-        first_order = torch.randperm(num_motifs, device=device)
+        boundary_positions = []
+        seq_pos = 0
+        first_order = torch.randperm(num_motifs)
         prev_order = first_order
-        blocks.append(motifs[first_order].reshape(-1))
-        for _ in range(1, num_blocks):
-            order = torch.randperm(num_motifs, device=device)
-            while torch.equal(order, prev_order):
-                order = torch.randperm(num_motifs, device=device)
-            blocks.append(motifs[order].reshape(-1))
+        for order in [first_order] + [None] * (num_blocks - 1):
+            if order is None:
+                order = torch.randperm(num_motifs)
+                while torch.equal(order, prev_order):
+                    order = torch.randperm(num_motifs)
+            block_parts = []
+            for motif_idx in order.tolist():
+                motif = motifs[motif_idx]
+                block_parts.append(motif)
+                seq_pos += motif.numel()
+                if seq_pos < T:
+                    boundary_positions.append(seq_pos - 1)
+            blocks.append(torch.cat(block_parts))
             prev_order = order
 
         seq = torch.cat(blocks, dim=0)[:T]
         x[b] = seq
 
-        # Standard next-token targets, but only supervise tokens after the first full motif block.
+        # Standard next-token targets, but only supervise tokens after the first full motif
+        # block and never supervise transitions between motifs.
         y[b, :-1] = seq[1:]
         y[b, :motif_block_len] = -1
+        for boundary_pos in boundary_positions:
+            if boundary_pos < T - 1:
+                y[b, boundary_pos] = -1
 
     return x, y
 
