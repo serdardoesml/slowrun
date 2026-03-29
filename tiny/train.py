@@ -904,12 +904,17 @@ if SYNTHETIC_WARMUP_STEPS > 0:
         model.zero_grad(set_to_none=True)
         synchronize()
         dt = time.time() - t0
+        warmup_loss_avg = warmup_loss.float()
+        if ddp:
+            dist.all_reduce(warmup_loss_avg, op=dist.ReduceOp.SUM)
+            warmup_loss_avg /= ddp_world_size
+        warmup_loss_value = warmup_loss_avg.item()
         if synth_step % 50 == 0 or warmup_step == 0:
-            print0(f"synth step {synth_step:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss.item():.6f} | dt: {dt*1000:.2f}ms")
+            print0(f"synth step {synth_step:04d}/{SYNTHETIC_WARMUP_STEPS} | loss: {warmup_loss_value:.6f} | dt: {dt*1000:.2f}ms")
         if master_process:
-            wandb_run.log({"synth_step": synth_step, "synth-train/loss": warmup_loss.item()})
-        if warmup_loss.item() < SYNTHETIC_EARLY_EXIT_LOSS:
-            print0(f"Ending synthetic warmup early at synth step {synth_step:04d} | loss: {warmup_loss.item():.6f}")
+            wandb_run.log({"synth_step": synth_step, "synth-train/loss": warmup_loss_value})
+        if warmup_loss_value < SYNTHETIC_EARLY_EXIT_LOSS:
+            print0(f"Ending synthetic warmup early at synth step {synth_step:04d} | loss: {warmup_loss_value:.6f}")
             break
     print0("Finished synthetic warmup")
     # Reset optimizer state so fineweb training starts with fresh moments.
