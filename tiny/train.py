@@ -727,7 +727,7 @@ else:
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
-_wandb_kwargs = {"project": "nanochat", "name": run_name}
+_wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -977,4 +977,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
