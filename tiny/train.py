@@ -110,9 +110,11 @@ FINAL_LR_FRAC = 0.0
 
 # Synthetic pre-pretraining warmup
 SYNTHETIC_WARMUP_STEPS = 2000
-SYNTHETIC_NUM_MOTIFS = 32
-SYNTHETIC_MOTIF_LEN = 8
-SYNTHETIC_MOTIF_LEN_JITTER = 4
+SYNTHETIC_WARMUP_ALPHABET = 4
+SYNTHETIC_WARMUP_RADIUS = 1
+SYNTHETIC_WARMUP_WIDTH = 64
+SYNTHETIC_WARMUP_MASK_ROWS = 8
+SYNTHETIC_WARMUP_DELIMITER = 198 # Newline token
 SYNTHETIC_EARLY_EXIT_LOSS = 0.07
 
 # =============================================================================
@@ -665,57 +667,71 @@ class DataLoader:
 
 
 
-def make_synthetic_batch(B, T, vocab_size, device, num_motifs=SYNTHETIC_NUM_MOTIFS,
-                         motif_len=SYNTHETIC_MOTIF_LEN, motif_len_jitter=SYNTHETIC_MOTIF_LEN_JITTER):
-    """Create a batch where an initial motif block is repeated in different orders to fill the full context.
-    Loss is masked on the first presentation and at motif boundaries so only repeated
-    within-motif continuations train the model.
+def make_synthetic_batch(B, T, vocab_size, device,
+                         alphabet=SYNTHETIC_WARMUP_ALPHABET,
+                         radius=SYNTHETIC_WARMUP_RADIUS,
+                         width=SYNTHETIC_WARMUP_WIDTH,
+                         mask_rows=SYNTHETIC_WARMUP_MASK_ROWS,
+                         delimiter=SYNTHETIC_WARMUP_DELIMITER,
+                         eot_token=None):
+    """Create a batch from fresh-sampled 1D local update rules rolled out over time.
+    Loss is masked on the first few rows so the model must infer the rule from context
+    before being trained on later rows.
     """
+    assert alphabet > 1, "alphabet must be at least 2"
+    assert radius >= 1, "radius must be at least 1"
+    assert width >= 1, "width must be at least 1"
+    assert 0 <= delimiter < vocab_size, f"delimiter must be in [0, vocab_size), got delimiter={delimiter}, vocab_size={vocab_size}"
+    reserved_tokens = {delimiter}
+    if eot_token is not None:
+        assert 0 <= eot_token < vocab_size, f"eot_token must be in [0, vocab_size), got eot_token={eot_token}, vocab_size={vocab_size}"
+        reserved_tokens.add(eot_token)
+    assert alphabet <= vocab_size - len(reserved_tokens), (
+        f"alphabet must fit in the vocab after reserving special tokens, "
+        f"got alphabet={alphabet}, vocab_size={vocab_size}, reserved={len(reserved_tokens)}"
+    )
+    row_span = width + 1
+    assert row_span <= T, f"Synthetic warmup width must satisfy width+1 <= T, got width={width}, T={T}"
+
+    num_rows = math.ceil(T / row_span)
+    neighborhood_size = 2 * radius + 1
+    rule_table_size = alphabet ** neighborhood_size
+    delimiter_token = torch.tensor([delimiter], device=device, dtype=torch.long)
+
     x = torch.empty(B, T, device=device, dtype=torch.long)
     y = torch.full((B, T), -1, device=device, dtype=torch.long)
 
-    min_motif_len = max(1, motif_len - motif_len_jitter)
-    max_motif_len = motif_len + motif_len_jitter
-
     for b in range(B):
-        motif_lengths = torch.randint(min_motif_len, max_motif_len + 1, (num_motifs,))
-        motif_block_len = int(motif_lengths.sum().item())
-        assert motif_block_len + 1 <= T, f"Synthetic layout needs at least {motif_block_len + 1} tokens, got T={T}"
-        num_blocks = math.ceil(T / motif_block_len)
-        motifs = [
-            torch.randint(0, vocab_size, (motif_len_i,), device=device, dtype=torch.long)
-            for motif_len_i in motif_lengths.tolist()
-        ]
-        blocks = []
-        boundary_positions = []
-        seq_pos = 0
-        first_order = torch.randperm(num_motifs)
-        prev_order = first_order
-        for order in [first_order] + [None] * (num_blocks - 1):
-            if order is None:
-                order = torch.randperm(num_motifs)
-                while torch.equal(order, prev_order):
-                    order = torch.randperm(num_motifs)
-            block_parts = []
-            for motif_idx in order.tolist():
-                motif = motifs[motif_idx]
-                block_parts.append(motif)
-                seq_pos += motif.numel()
-                if seq_pos < T:
-                    boundary_positions.append(seq_pos - 1)
-            blocks.append(torch.cat(block_parts))
-            prev_order = order
+        rule_table = torch.randint(0, alphabet, (rule_table_size,), device=device, dtype=torch.long)
+        visible_symbols = torch.empty(0, device=device, dtype=torch.long)
+        while visible_symbols.numel() < alphabet:
+            candidates = torch.randint(0, vocab_size, (alphabet * 4,), device=device, dtype=torch.long)
+            for token in reserved_tokens:
+                candidates = candidates[candidates != token]
+            if visible_symbols.numel() > 0:
+                candidates = torch.cat([visible_symbols, candidates], dim=0)
+            visible_symbols = torch.unique(candidates, sorted=False)
+        visible_symbols = visible_symbols[:alphabet]
+        state = torch.randint(0, alphabet, (width,), device=device, dtype=torch.long)
 
-        seq = torch.cat(blocks, dim=0)[:T]
+        rows = []
+        for _ in range(num_rows):
+            rows.append(torch.cat([
+                visible_symbols[state],
+                delimiter_token,
+            ]))
+
+            padded = torch.cat([state[-radius:], state, state[:radius]], dim=0)
+            neighborhoods = padded.unfold(0, neighborhood_size, 1)
+            multipliers = (alphabet ** torch.arange(neighborhood_size - 1, -1, -1, device=device, dtype=torch.long))
+            rule_indices = (neighborhoods * multipliers).sum(dim=-1)
+            state = rule_table[rule_indices]
+
+        seq = torch.cat(rows, dim=0)[:T]
         x[b] = seq
-
-        # Standard next-token targets, but only supervise tokens after the first full motif
-        # block and never supervise transitions between motifs.
         y[b, :-1] = seq[1:]
-        y[b, :motif_block_len] = -1
-        for boundary_pos in boundary_positions:
-            if boundary_pos < T - 1:
-                y[b, boundary_pos] = -1
+        y[b, y[b] == delimiter] = -1
+        y[b, :min(mask_rows * row_span, T)] = -1
 
     return x, y
 
@@ -908,7 +924,13 @@ if SYNTHETIC_WARMUP_STEPS > 0:
         synchronize()
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
-            x_syn, y_syn = make_synthetic_batch(args.device_batch_size, MAX_SEQ_LEN, vocab_size, device)
+            x_syn, y_syn = make_synthetic_batch(
+                args.device_batch_size,
+                MAX_SEQ_LEN,
+                vocab_size,
+                device,
+                eot_token=eot_id,
+            )
             with autocast_ctx:
                 loss = model(x_syn, y_syn)
             warmup_loss = loss.detach()
