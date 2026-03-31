@@ -60,6 +60,7 @@ parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
 parser.add_argument("--lr_multiplier", type=float, default=1.0)
+parser.add_argument("--synth-lr-mult", type=float, default=0.1)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
@@ -826,6 +827,7 @@ print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+print0(f"  synth_lr_mult={args.synth_lr_mult}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
@@ -936,7 +938,7 @@ if SYNTHETIC_WARMUP_STEPS > 0:
             warmup_loss = loss.detach()
             (loss / grad_accum_steps).backward()
         for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"]
+            group["lr"] = group["initial_lr"] * args.synth_lr_mult
             if "initial_wd" not in group:
                 group["initial_wd"] = group.get("weight_decay", 0.0)
             group["weight_decay"] = group["initial_wd"]
@@ -1099,6 +1101,7 @@ if args.save_result and master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "synth_lr_mult": args.synth_lr_mult,
         "synth_steps": synth_step,
         "fineweb_steps": step,
         "val_loss": val_loss,
