@@ -14,6 +14,8 @@ import math
 import time
 import json
 import argparse
+import random
+import sys
 from types import SimpleNamespace
 from functools import partial
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.utils.data as torch_data
 from torch import Tensor
 import wandb
 import numpy as np
@@ -111,11 +114,7 @@ FINAL_LR_FRAC = 0.0
 
 # Synthetic pre-pretraining warmup
 SYNTHETIC_WARMUP_STEPS = 2000
-SYNTHETIC_WARMUP_ALPHABET = 4
-SYNTHETIC_WARMUP_RADIUS = 1
-SYNTHETIC_WARMUP_WIDTH = 64
-SYNTHETIC_WARMUP_MASK_ROWS = 8
-SYNTHETIC_WARMUP_DELIMITER = 198 # Newline token
+SYNTHETIC_WARMUP_K = 16
 SYNTHETIC_EARLY_EXIT_LOSS = 0.07
 
 # =============================================================================
@@ -665,76 +664,94 @@ class DataLoader:
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
+    
+def make_kshuffle_sequence_cpu(seq_len, k, bos_id, allowed_tokens, rng):
+    """Create one CPU sequence: BOS followed by a valid balanced k-shuffle Dyck string."""
+    assert seq_len >= 3, f"seq_len must be at least 3, got {seq_len}"
+    payload_len = seq_len - 1
+    assert payload_len % 2 == 0, f"seq_len - 1 must be even for balanced Dyck strings, got seq_len={seq_len}"
+    visible_tokens = rng.sample(allowed_tokens, 2 * k)
+    open_ids = visible_tokens[:k]
+    close_ids = visible_tokens[k:]
+
+    depths = [0] * k
+    open_total = 0
+    seq = [bos_id]
+
+    for pos in range(payload_len):
+        remaining = payload_len - pos
+
+        # If all remaining positions are needed just to close currently open brackets, we must close.
+        if open_total == remaining:
+            active = [i for i, depth in enumerate(depths) if depth > 0]
+            idx = rng.choice(active)
+            seq.append(close_ids[idx])
+            depths[idx] -= 1
+            open_total -= 1
+            continue
+
+        can_open = open_total + 1 <= (remaining - 1)
+        can_close = open_total > 0
+
+        if not can_close:
+            # Nothing is open yet, so we must open.
+            idx = rng.randrange(k)
+            seq.append(open_ids[idx])
+            depths[idx] += 1
+            open_total += 1
+            continue
+
+        if not can_open:
+            # Opening would make exact balancing impossible, so we must close.
+            active = [i for i, depth in enumerate(depths) if depth > 0]
+            idx = rng.choice(active)
+            seq.append(close_ids[idx])
+            depths[idx] -= 1
+            open_total -= 1
+            continue
+
+        # Otherwise choose between opening and closing, with increasing close bias later in the sequence.
+        close_bias = open_total / remaining
+        if rng.random() < close_bias:
+            active = [i for i, depth in enumerate(depths) if depth > 0]
+            idx = rng.choice(active)
+            seq.append(close_ids[idx])
+            depths[idx] -= 1
+            open_total -= 1
+        else:
+            idx = rng.randrange(k)
+            seq.append(open_ids[idx])
+            depths[idx] += 1
+            open_total += 1
+
+    assert open_total == 0, "Generated k-shuffle Dyck sequence is not balanced"
+    return seq
 
 
+class SyntheticSequenceDataset(torch_data.IterableDataset):
+    """Infinite stream of CPU-generated k-shuffle Dyck training rows."""
+    def __init__(self, seq_len, vocab_size, k, bos_id, seed):
+        super().__init__()
+        assert bos_id is not None
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.k = k
+        self.bos_id = bos_id
+        self.seed = seed
+        self.allowed_tokens = [i for i in range(vocab_size) if i != bos_id]
+        assert 2 * k <= len(self.allowed_tokens), (
+            f"Need at least 2*k visible tokens after reserving BOS, got k={k}, "
+            f"available={len(self.allowed_tokens)}"
+        )
 
-def make_synthetic_batch(B, T, vocab_size, device,
-                         alphabet=SYNTHETIC_WARMUP_ALPHABET,
-                         radius=SYNTHETIC_WARMUP_RADIUS,
-                         width=SYNTHETIC_WARMUP_WIDTH,
-                         mask_rows=SYNTHETIC_WARMUP_MASK_ROWS,
-                         delimiter=SYNTHETIC_WARMUP_DELIMITER,
-                         eot_token=None):
-    """Create a batch from fresh-sampled 1D local update rules rolled out over time.
-    Loss is masked on the first few rows so the model must infer the rule from context
-    before being trained on later rows.
-    """
-    assert alphabet > 1, "alphabet must be at least 2"
-    assert radius >= 1, "radius must be at least 1"
-    assert width >= 1, "width must be at least 1"
-    assert 0 <= delimiter < vocab_size, f"delimiter must be in [0, vocab_size), got delimiter={delimiter}, vocab_size={vocab_size}"
-    reserved_tokens = {delimiter}
-    if eot_token is not None:
-        assert 0 <= eot_token < vocab_size, f"eot_token must be in [0, vocab_size), got eot_token={eot_token}, vocab_size={vocab_size}"
-        reserved_tokens.add(eot_token)
-    assert alphabet <= vocab_size - len(reserved_tokens), (
-        f"alphabet must fit in the vocab after reserving special tokens, "
-        f"got alphabet={alphabet}, vocab_size={vocab_size}, reserved={len(reserved_tokens)}"
-    )
-    row_span = width + 1
-    assert row_span <= T, f"Synthetic warmup width must satisfy width+1 <= T, got width={width}, T={T}"
-
-    num_rows = math.ceil(T / row_span)
-    neighborhood_size = 2 * radius + 1
-    rule_table_size = alphabet ** neighborhood_size
-    delimiter_token = torch.tensor([delimiter], device=device, dtype=torch.long)
-
-    x = torch.empty(B, T, device=device, dtype=torch.long)
-    y = torch.full((B, T), -1, device=device, dtype=torch.long)
-
-    for b in range(B):
-        rule_table = torch.randint(0, alphabet, (rule_table_size,), device=device, dtype=torch.long)
-        visible_symbols = torch.empty(0, device=device, dtype=torch.long)
-        while visible_symbols.numel() < alphabet:
-            candidates = torch.randint(0, vocab_size, (alphabet * 4,), device=device, dtype=torch.long)
-            for token in reserved_tokens:
-                candidates = candidates[candidates != token]
-            if visible_symbols.numel() > 0:
-                candidates = torch.cat([visible_symbols, candidates], dim=0)
-            visible_symbols = torch.unique(candidates, sorted=False)
-        visible_symbols = visible_symbols[:alphabet]
-        state = torch.randint(0, alphabet, (width,), device=device, dtype=torch.long)
-
-        rows = []
-        for _ in range(num_rows):
-            rows.append(torch.cat([
-                visible_symbols[state],
-                delimiter_token,
-            ]))
-
-            padded = torch.cat([state[-radius:], state, state[:radius]], dim=0)
-            neighborhoods = padded.unfold(0, neighborhood_size, 1)
-            multipliers = (alphabet ** torch.arange(neighborhood_size - 1, -1, -1, device=device, dtype=torch.long))
-            rule_indices = (neighborhoods * multipliers).sum(dim=-1)
-            state = rule_table[rule_indices]
-
-        seq = torch.cat(rows, dim=0)[:T]
-        x[b] = seq
-        y[b, :-1] = seq[1:]
-        y[b, y[b] == delimiter] = -1
-        y[b, :min(mask_rows * row_span, T)] = -1
-
-    return x, y
+    def __iter__(self):
+        worker = torch_data.get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        rng = random.Random(self.seed + 1000 * worker_id)
+        while True:
+            seq = make_kshuffle_sequence_cpu(self.seq_len, self.k, self.bos_id, self.allowed_tokens, rng)
+            row = torch.tensor(seq, dtype=torch.long)
+            yield row[:-1], row[1:]
 
 # =============================================================================
 # Loss evaluation
@@ -848,6 +865,27 @@ for i in range(vocab_size):
         token_bytes_list.append(len(encoder.decode_single_token_bytes(i)))
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
+synth_loader = None
+if SYNTHETIC_WARMUP_STEPS > 0:
+    synth_workers = 0 if sys.platform == "darwin" else min(4, os.cpu_count() or 1)
+    synth_dataset = SyntheticSequenceDataset(
+        seq_len=MAX_SEQ_LEN + 1,
+        vocab_size=vocab_size,
+        k=SYNTHETIC_WARMUP_K,
+        bos_id=eot_id,
+        seed=seed,
+    )
+    synth_loader_kwargs = dict(
+        batch_size=args.device_batch_size,
+        num_workers=synth_workers,
+        pin_memory=device_type == "cuda",
+        persistent_workers=synth_workers > 0,
+    )
+    if synth_workers > 0:
+        synth_loader_kwargs["prefetch_factor"] = 4
+    synth_loader = iter(torch_data.DataLoader(synth_dataset, **synth_loader_kwargs))
+    print0(f"Synthetic loader: {synth_workers} CPU worker(s), pinned={device_type == 'cuda'}")
+
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
 with torch.device("meta"):
@@ -926,13 +964,9 @@ if SYNTHETIC_WARMUP_STEPS > 0:
         synchronize()
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
-            x_syn, y_syn = make_synthetic_batch(
-                args.device_batch_size,
-                MAX_SEQ_LEN,
-                vocab_size,
-                device,
-                eot_token=eot_id,
-            )
+            x_syn_cpu, y_syn_cpu = next(synth_loader)
+            x_syn = x_syn_cpu.to(device, non_blocking=device_type == "cuda")
+            y_syn = y_syn_cpu.to(device, non_blocking=device_type == "cuda")
             with autocast_ctx:
                 loss = model(x_syn, y_syn)
             warmup_loss = loss.detach()
