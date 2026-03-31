@@ -46,6 +46,7 @@ parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
+parser.add_argument("--synth-embed-lr", type=float, default=0.007)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
 parser.add_argument("--weight-decay", type=float, default=0.8)
 # WD follows a 3-phase schedule: hold → decay → ramp
@@ -391,7 +392,7 @@ class GPT(nn.Module):
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', name='embed', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
@@ -843,6 +844,7 @@ print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
+print0(f"  synth_embed_lr={args.synth_embed_lr}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
@@ -961,6 +963,9 @@ ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_em
 # Synthetic pre-pretraining warmup (excluded from main step count and main metrics)
 if SYNTHETIC_WARMUP_STEPS > 0:
     print0(f"Starting synthetic warmup for {SYNTHETIC_WARMUP_STEPS} steps")
+    synth_dropout_modules = [module for module in model.modules() if isinstance(module, nn.Dropout)]
+    for module in synth_dropout_modules:
+        module.p = 0.0
     model.train()
     for warmup_step in range(SYNTHETIC_WARMUP_STEPS):
         synth_step = warmup_step + 1
@@ -976,7 +981,8 @@ if SYNTHETIC_WARMUP_STEPS > 0:
             (loss / grad_accum_steps).backward()
         synth_lrm = get_synth_lr_multiplier(warmup_step)
         for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * synth_lrm
+            base_lr = args.synth_embed_lr if group.get("name") == "embed" else group["initial_lr"]
+            group["lr"] = base_lr * synth_lrm
             if "initial_wd" not in group:
                 group["initial_wd"] = group.get("weight_decay", 0.0)
             group["weight_decay"] = group["initial_wd"]
@@ -998,6 +1004,8 @@ if SYNTHETIC_WARMUP_STEPS > 0:
         if warmup_loss_value < SYNTHETIC_EARLY_EXIT_LOSS:
             print0(f"Ending synthetic warmup early at synth step {synth_step:04d} | loss: {warmup_loss_value:.6f}")
             break
+    for module in synth_dropout_modules:
+        module.p = args.dropout
     print0("Finished synthetic warmup")
     # Reset optimizer state so fineweb training starts with fresh moments.
     optimizer = model.setup_optimizer()
@@ -1137,6 +1145,7 @@ wandb_run.summary["fineweb_steps"] = step
 if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
+        "synth_embed_lr": args.synth_embed_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
         "synth_steps": synth_step,
