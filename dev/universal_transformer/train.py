@@ -68,7 +68,7 @@ parser.add_argument("--eval-logit-avg", action="store_true",
 args = parser.parse_args()
 
 
-def parse_n_layer_schedule(spec):
+def parse_n_layer_schedule(spec): # Might be overly redundant with all the checks, but i can't justify removing it.
     schedule = []
     for item in spec.split(","):
         item = item.strip()
@@ -391,14 +391,29 @@ class GPT(nn.Module):
         max_keys = min(window + 1, seq_len)
         return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
-    def estimate_flops(self):
-        nparams = sum(p.numel() for p in self.parameters())
-        nparams_exclude = (self.transformer.wte.weight.numel()
-                          + self.resid_lambdas.numel()
-                          + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+    def estimate_flops(self): 
+        # Counts effective params (recursion counted as multiple) which should be more accurate.
+        # But not sure if the 6x multiplier still makes sense in this case.
+        shared_attn = sum(p.numel() for p in self.encoder_attn.parameters()) + sum(p.numel() for p in self.decoder_attn.parameters())
+        shared_mlp = sum(p.numel() for p in self.encoder_mlp.parameters()) + sum(p.numel() for p in self.decoder_mlp.parameters())
+        active_layers = list(range(self.active_encoder_layers)) + list(range(self.active_decoder_start, self.max_n_layer))
+        nparams = (
+            self.transformer.wte.weight.numel()
+            + self.lm_head.weight.numel()
+            + self.active_encoder_layers * (shared_attn + shared_mlp)
+            + sum(p.numel() for i in active_layers for p in self.transformer.h[i].parameters())
+            + sum(p.numel() for i in active_layers if str(i) in self.ve_projs for p in self.ve_projs[str(i)].parameters())
+            + 3 * self.active_encoder_layers
+        )
+        nparams_exclude = self.transformer.wte.weight.numel() + 3 * self.active_encoder_layers
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        attn_flops = sum(
+            12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+            for i in range(self.active_encoder_layers)
+        ) + sum(
+            12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
+            for i in range(self.active_decoder_start, self.max_n_layer)
+        )
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
@@ -1118,11 +1133,13 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         if grow_now:
             layer_schedule_idx += 1
             orig_model.set_active_layers(N_LAYER_SCHEDULE[layer_schedule_idx][1])
+            num_flops_per_token = orig_model.estimate_flops()
             print0(f"Step {step:05d} | n_layer -> {orig_model.active_n_layer}")
             wandb_run.log({"step": step, "model/n_layer": orig_model.active_n_layer})
     elif grow_now:
         layer_schedule_idx += 1
         orig_model.set_active_layers(N_LAYER_SCHEDULE[layer_schedule_idx][1])
+        num_flops_per_token = orig_model.estimate_flops()
         print0(f"Step {step:05d} | n_layer -> {orig_model.active_n_layer}")
         wandb_run.log({"step": step, "model/n_layer": orig_model.active_n_layer})
 
