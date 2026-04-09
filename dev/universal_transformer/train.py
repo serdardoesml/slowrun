@@ -42,7 +42,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n-layer-schedule", type=str, default="0:10,1533:22",
+parser.add_argument("--n-layer-schedule", type=str, default="0:12,1533:24",
                     help="Comma-separated depth schedule in step:n_layer format, must start at step 0")
 parser.add_argument("--n_head", type=int, default=16)
 parser.add_argument("--n_embd", type=int, default=2048)
@@ -264,7 +264,7 @@ class SharedCausalSelfAttention(nn.Module):
 class SharedMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden = 9 * config.n_embd
+        hidden = 8 * config.n_embd
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
