@@ -22,4 +22,6 @@ Total wall time: 3870.76s (64.51m)
 Introduced by Google back in 2019 (https://arxiv.org/pdf/1807.03819).
 Similar architectures have been effective for reasoning and ARC-AGI. (https://arxiv.org/pdf/2510.04871, https://arxiv.org/pdf/2512.14693)
 
- Recursion is a good inductive bias for those kinds of problems. Hasn't been explored yet for language modeling (Except for looping certain layers only or looping through multiple blocks at once).
+ Recursion is a good inductive bias for those kinds of problems. Hasn't been explored yet for autoregressive language modeling (Except for looping certain layers only or looping through multiple blocks at once).
+
+ Google also made a recursive version of BERT called ALBERT for parameter efficiency back in 2020. (https://arxiv.org/pdf/1909.11942)
