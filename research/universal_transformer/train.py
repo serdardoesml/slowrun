@@ -39,7 +39,7 @@ parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
-parser.add_argument("--weight-decay", type=float, default=0.6)
+parser.add_argument("--weight-decay", type=float, default=0.8)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n-layer-schedule", type=str, default="0:10,1533:20",
