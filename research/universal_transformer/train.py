@@ -42,7 +42,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n-layer-schedule", type=str, default="0:12,1533:24",
+parser.add_argument("--n-layer-schedule", type=str, default="0:9,1533:18",
                     help="Comma-separated depth schedule in step:n_layer format, must start at step 0")
 parser.add_argument("--n_head", type=int, default=16)
 parser.add_argument("--n_embd", type=int, default=2048)
@@ -276,15 +276,21 @@ class SharedMLP(nn.Module):
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn_norm = RMSNorm(config.n_embd)
+        self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
         self.mlp_norm = RMSNorm(config.n_embd)
         head_dim = config.n_embd // config.n_head
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
+        self.q_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
+        self.k_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, config.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self.attn_gate_channels = 12
-        self.attn_gate = nn.Linear(self.attn_gate_channels, config.n_head, bias=False)
+        has_value_embed = has_ve(layer_idx, config.n_layer)
+        self.ve_gates = nn.ModuleList([
+            nn.Linear(self.ve_gate_channels, config.n_kv_head, bias=False) if has_value_embed else nn.Identity()
+            for _ in range(2)
+        ])
+        self.attn_gates = nn.ModuleList([
+            nn.Linear(self.attn_gate_channels, config.n_head, bias=False) for _ in range(2)
+        ])
 
 
 class GPT(nn.Module):
@@ -300,8 +306,8 @@ class GPT(nn.Module):
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
-        self.encoder_attn = SharedCausalSelfAttention(config)
-        self.decoder_attn = SharedCausalSelfAttention(config)
+        self.encoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
+        self.decoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
         self.encoder_mlp = SharedMLP(config)
         self.decoder_mlp = SharedMLP(config)
         self.transformer = nn.ModuleDict({
@@ -327,7 +333,7 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        for attn in (self.encoder_attn, self.decoder_attn):
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
             torch.nn.init.uniform_(attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(attn.c_v.weight, -s, s)
@@ -341,17 +347,21 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
-            block.attn_norm.weight.fill_(1.0)
-            block.attn_norm.bias.zero_()
+            for attn_norm in block.attn_norms:
+                attn_norm.weight.fill_(1.0)
+                attn_norm.bias.zero_()
             block.mlp_norm.weight.fill_(1.0)
             block.mlp_norm.bias.zero_()
-            block.q_norm.weight.fill_(1.0)
-            block.q_norm.bias.zero_()
-            block.k_norm.weight.fill_(1.0)
-            block.k_norm.bias.zero_()
-            if block.ve_gate is not None:
-                torch.nn.init.zeros_(block.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn_gate.weight)
+            for q_norm, k_norm in zip(block.q_norms, block.k_norms):
+                q_norm.weight.fill_(1.0)
+                q_norm.bias.zero_()
+                k_norm.weight.fill_(1.0)
+                k_norm.bias.zero_()
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    torch.nn.init.zeros_(ve_gate.weight)
+            for attn_gate in block.attn_gates:
+                torch.nn.init.zeros_(attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -394,7 +404,7 @@ class GPT(nn.Module):
     def estimate_flops(self): 
         # Counts effective params (recursion counted as multiple) which should be more accurate.
         # But not sure if the 6x multiplier still makes sense in this case.
-        shared_attn = sum(p.numel() for p in self.encoder_attn.parameters()) + sum(p.numel() for p in self.decoder_attn.parameters())
+        shared_attn = sum(p.numel() for p in self.encoder_attns.parameters()) + sum(p.numel() for p in self.decoder_attns.parameters())
         shared_mlp = sum(p.numel() for p in self.encoder_mlp.parameters()) + sum(p.numel() for p in self.decoder_mlp.parameters())
         active_layers = list(range(self.active_encoder_layers)) + list(range(self.active_decoder_start, self.max_n_layer))
         nparams = (
@@ -419,21 +429,23 @@ class GPT(nn.Module):
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
         shared_params = (
-            [self.encoder_attn.c_q.weight, self.encoder_attn.c_k.weight, self.encoder_attn.c_v.weight, self.encoder_attn.c_proj.weight]
-            + [self.decoder_attn.c_q.weight, self.decoder_attn.c_k.weight, self.decoder_attn.c_v.weight, self.decoder_attn.c_proj.weight]
+            list(self.encoder_attns.parameters())
+            + list(self.decoder_attns.parameters())
             + list(self.encoder_mlp.parameters())
             + list(self.decoder_mlp.parameters())
         )
         layer_matrix_params = []
         norm_params = []
         for block in self.transformer.h:
-            layer_matrix_params.append(block.attn_gate.weight)
-            norm_params.extend(block.attn_norm.parameters())
+            for attn_gate in block.attn_gates:
+                layer_matrix_params.append(attn_gate.weight)
+            norm_params.extend(block.attn_norms.parameters())
             norm_params.extend(block.mlp_norm.parameters())
-            norm_params.extend(block.q_norm.parameters())
-            norm_params.extend(block.k_norm.parameters())
-            if block.ve_gate is not None:
-                layer_matrix_params.append(block.ve_gate.weight)
+            norm_params.extend(block.q_norms.parameters())
+            norm_params.extend(block.k_norms.parameters())
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    layer_matrix_params.append(ve_gate.weight)
         matrix_params = shared_params + layer_matrix_params + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
@@ -461,14 +473,20 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attn, shared_mlp):
+    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp):
         block = self.transformer.h[layer_idx]
         x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
         ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
-        attn_input = block.attn_norm(x)
-        ve_gate = block.ve_gate(attn_input[..., :block.ve_gate_channels]) if block.ve_gate is not None else None
-        attn_gate = block.attn_gate(attn_input[..., :block.attn_gate_channels])
-        x = x + shared_attn(attn_input, ve, cos_sin, self.window_sizes[layer_idx], block.q_norm, block.k_norm, ve_gate=ve_gate, attn_gate=attn_gate)
+        for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
+            shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
+        ):
+            attn_input = attn_norm(x)
+            ve_gate_out = ve_gate(attn_input[..., :block.ve_gate_channels]) if isinstance(ve_gate, nn.Linear) else None
+            attn_gate_out = attn_gate(attn_input[..., :block.attn_gate_channels])
+            x = x + attn(
+                attn_input, ve, cos_sin, self.window_sizes[layer_idx], q_norm, k_norm,
+                ve_gate=ve_gate_out, attn_gate=attn_gate_out
+            )
         mlp_input = block.mlp_norm(x)
         x = x + shared_mlp(mlp_input)
         return x
@@ -480,7 +498,7 @@ class GPT(nn.Module):
             j = self.max_n_layer - 1 - i
             if 0 <= j < len(encoder_outputs):
                 x = x + self.skip_weights[i - self.max_encoder_layers] * encoder_outputs[j]
-            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attn, self.decoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attns, self.decoder_mlp)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -492,7 +510,7 @@ class GPT(nn.Module):
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.active_encoder_layers):
-            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attn, self.encoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attns, self.encoder_mlp)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -935,8 +953,8 @@ model.init_weights()
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = (
     sum(p.numel() for p in model.transformer.h.parameters())
-    + sum(p.numel() for p in model.encoder_attn.parameters())
-    + sum(p.numel() for p in model.decoder_attn.parameters())
+    + sum(p.numel() for p in model.encoder_attns.parameters())
+    + sum(p.numel() for p in model.decoder_attns.parameters())
     + sum(p.numel() for p in model.encoder_mlp.parameters())
     + sum(p.numel() for p in model.decoder_mlp.parameters())
 )
