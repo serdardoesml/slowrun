@@ -42,7 +42,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=0.6)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n-layer-schedule", type=str, default="0:9,1533:18",
+parser.add_argument("--n-layer-schedule", type=str, default="0:10,1533:20",
                     help="Comma-separated depth schedule in step:n_layer format, must start at step 0")
 parser.add_argument("--n_head", type=int, default=16)
 parser.add_argument("--n_embd", type=int, default=2048)
