@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
