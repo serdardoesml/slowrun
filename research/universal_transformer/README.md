@@ -11,12 +11,19 @@ Parameter count decreases to 512M (260M for the 2 shared blocks of width 2048 wi
 
 It's not competitive yet with the baseline, however it could be a strong contender for the unlimited track if the gains from scaling up model size and weight decay hit a wall.
 
-## Training summary: 
-Total training time: 58.82m                                                     
-Final train loss: 2.796117                                                      
-Min val BPB: 1.074007                                                           
-Min val Loss: 3.305028                                                          
-Total wall time: 3870.76s (64.51m) 
+## Update: 
+Added stochastic depth and IHA from the main branch. The other changes did not transfer well.
+
+Changed the recursive block structure so we have 2 independent attention layers and 1 MLP in both the encoder and decoder block. Reduced recursion depth to match train time. 
+
+The intuition behind this for me is this since the MLP block is shared, a lot of it is prematurely applied before the attention circuits fetches the necessary information, applying the mlp after 2 attention layers should help with this. Also having 2 independent attention layers should allow circuits like induction heads to form easier.
+
+## Training summary (After update): 
+Total training time: 60.55m
+Final train loss: 2.850428
+Min val BPB: 1.070614
+Min val Loss: 3.294537
+Total wall time: 4029.10s (67.15m)
 
 ## More on the universal transformer
 Introduced by Google back in 2019 (https://arxiv.org/pdf/1807.03819). They also made a recursive version of BERT called ALBERT for parameter efficiency back in 2020. (https://arxiv.org/pdf/1909.11942)
