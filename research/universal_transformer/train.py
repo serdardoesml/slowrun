@@ -54,6 +54,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--stoch-depth", type=float, default=0.05,
+                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio")
 parser.add_argument("--logit-cap", type=float, default=10.0,
@@ -67,6 +69,12 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA cross-head mixing")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
 args = parser.parse_args()
 
 
@@ -206,6 +214,9 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    stoch_depth: float = 0.05
+    use_iha: bool = False
+    iha_mix_v: bool = True
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -243,12 +254,34 @@ class SharedCausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.use_iha = config.use_iha
+        if self.use_iha:
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, num_heads):
+        d = self.head_dim
+        return (mix @ weight.view(num_heads, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size, q_norm, k_norm, ve_gate=None, attn_gate=None):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_iha:
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -293,6 +326,7 @@ class LayerBlock(nn.Module):
         self.attn_gates = nn.ModuleList([
             nn.Linear(self.attn_gate_channels, config.n_head, bias=False) for _ in range(2)
         ])
+        self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
 
 class GPT(nn.Module):
@@ -340,6 +374,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(attn.c_proj.weight)
+            if attn.use_iha:
+                torch.nn.init.eye_(attn.q_mix)
+                torch.nn.init.eye_(attn.k_mix)
+                if attn.iha_mix_v:
+                    torch.nn.init.eye_(attn.v_mix)
         for mlp in (self.encoder_mlp, self.decoder_mlp):
             torch.nn.init.uniform_(mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
@@ -430,6 +469,17 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
+        iha_params = []
+        iha_param_ids = set()
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
+            if attn.use_iha:
+                iha_params.append(attn.q_mix)
+                iha_params.append(attn.k_mix)
+                iha_param_ids.add(id(attn.q_mix))
+                iha_param_ids.add(id(attn.k_mix))
+                if attn.iha_mix_v:
+                    iha_params.append(attn.v_mix)
+                    iha_param_ids.add(id(attn.v_mix))
         shared_params = (
             list(self.encoder_attns.parameters())
             + list(self.decoder_attns.parameters())
@@ -448,7 +498,7 @@ class GPT(nn.Module):
             for ve_gate in block.ve_gates:
                 if isinstance(ve_gate, nn.Linear):
                     layer_matrix_params.append(ve_gate.weight)
-        matrix_params = shared_params + layer_matrix_params + list(self.ve_projs.parameters())
+        matrix_params = [p for p in shared_params if id(p) not in iha_param_ids] + layer_matrix_params + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -465,6 +515,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
+        if iha_params:
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -479,6 +531,7 @@ class GPT(nn.Module):
         block = self.transformer.h[layer_idx]
         x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
         ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
+        x_in = x
         for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
             shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
         ):
@@ -491,6 +544,9 @@ class GPT(nn.Module):
             )
         mlp_input = block.mlp_norm(x)
         x = x + shared_mlp(mlp_input)
+        if self.training and block.drop_prob > 0:
+            keep = (torch.rand((), device=x.device) >= block.drop_prob).to(x.dtype)
+            x = x_in + keep * (x - x_in)
         return x
 
     def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
@@ -929,6 +985,9 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  stoch_depth={args.stoch_depth}")
+if args.iha:
+    print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -946,7 +1005,9 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
