@@ -311,6 +311,7 @@ class SharedMLP(nn.Module):
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.resid_norm = RMSNorm(config.n_embd)
         self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
         self.mlp_norm = RMSNorm(config.n_embd)
         head_dim = config.n_embd // config.n_head
@@ -388,6 +389,8 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
+            block.resid_norm.weight.fill_(1.0)
+            block.resid_norm.bias.zero_()
             for attn_norm in block.attn_norms:
                 attn_norm.weight.fill_(1.0)
                 attn_norm.bias.zero_()
@@ -530,6 +533,7 @@ class GPT(nn.Module):
     def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp):
         block = self.transformer.h[layer_idx]
         x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
+        x = block.resid_norm(x)
         ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
         x_in = x
         for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
