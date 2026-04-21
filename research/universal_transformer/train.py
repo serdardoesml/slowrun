@@ -366,7 +366,7 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.mtp_weight = args.mtp_weight
         if self.mtp_weight > 0:
-            self.mtp_head = nn.Linear(2 * config.n_embd, padded_vocab, bias=False)
+            self.mtp_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.set_active_layers(config.initial_n_layer)
 
     @torch.no_grad()
@@ -595,9 +595,7 @@ class GPT(nn.Module):
             return lm_loss
         if self.mtp_weight <= 0:
             return lm_loss, {'lm_loss': lm_loss}
-        mtp_emb = rms_norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
-        mtp_inputs = torch.cat([x[:, :-1], mtp_emb], dim=-1)
-        mtp_logits = self.mtp_head(mtp_inputs)[..., :self.config.vocab_size].float()
+        mtp_logits = self.mtp_head(x[:, :-1])[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
         mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
