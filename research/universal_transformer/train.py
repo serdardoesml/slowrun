@@ -69,6 +69,8 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--mtp-weight", type=float, default=0.3,
+                    help="Multi-token prediction weight (0=off)")
 parser.add_argument("--iha", action="store_true", default=True,
                     help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
 parser.add_argument("--no-iha", action="store_false", dest="iha",
@@ -362,6 +364,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self.mtp_weight = args.mtp_weight
+        if self.mtp_weight > 0:
+            self.mtp_head = nn.Linear(2 * config.n_embd, padded_vocab, bias=False)
         self.set_active_layers(config.initial_n_layer)
 
     @torch.no_grad()
@@ -369,6 +374,8 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
+        if self.mtp_weight > 0:
+            torch.nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.001)
         for attn in [*self.encoder_attns, *self.decoder_attns]:
             torch.nn.init.uniform_(attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
@@ -502,6 +509,8 @@ class GPT(nn.Module):
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        if self.mtp_weight > 0:
+            lm_head_params += list(self.mtp_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
@@ -578,10 +587,23 @@ class GPT(nn.Module):
         x = rms_norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
-        if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                ignore_index=-1, reduction=loss_reduction)
-        return logits
+        if targets is None:
+            return logits
+        lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                  ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction != 'mean':
+            return lm_loss
+        if self.mtp_weight <= 0:
+            return lm_loss, {'lm_loss': lm_loss}
+        mtp_emb = rms_norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
+        mtp_inputs = torch.cat([x[:, :-1], mtp_emb], dim=-1)
+        mtp_logits = self.mtp_head(mtp_inputs)[..., :self.config.vocab_size].float()
+        if LOGIT_CAP > 0:
+            mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
+        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
+                                   targets[:, 1:].reshape(-1), ignore_index=-1)
+        loss = lm_loss + self.mtp_weight * mtp_loss
+        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -986,6 +1008,7 @@ print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_l
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"  stoch_depth={args.stoch_depth}")
+print0(f"  mtp_weight={args.mtp_weight}")
 if args.iha:
     print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
@@ -1058,6 +1081,8 @@ def precompile_schedule_depths(sample_x, sample_y):
         orig_model.train()
         with autocast_ctx:
             loss = model(sample_x, sample_y)
+            if isinstance(loss, tuple):
+                loss = loss[0]
         loss.backward()
         warmup_optimizer.step()
         model.zero_grad(set_to_none=True)
@@ -1134,6 +1159,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
+            metrics = None
+            if isinstance(loss, tuple):
+                loss, metrics = loss
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -1162,7 +1190,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     total_training_time += dt
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / step / 60:.1f}m"
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    log_data = {"step": step, "train/loss": debiased, "train/mfu": mfu}
+    if metrics is not None:
+        log_data.update({f"train/{k}": v.item() for k, v in metrics.items()})
+    wandb_run.log(log_data)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
