@@ -45,7 +45,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
 parser.add_argument("--weight-decay", type=float, default=0.1)
-parser.add_argument("--warmdown-ratio", type=float, default=0.25,
+parser.add_argument("--warmdown-ratio", type=float, default=0.35,
                     help="Override warmdown ratio (default 0.2)")
 parser.add_argument("--total-batch-size", type=int, default=131072)
 parser.add_argument("--save-result", type=str, default="")
