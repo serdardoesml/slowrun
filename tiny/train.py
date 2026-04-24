@@ -108,6 +108,7 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+MTP_WEIGHT = 0.3
 
 # =============================================================================
 # Utilities
@@ -286,6 +287,7 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.mtp_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
@@ -303,6 +305,7 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -378,12 +381,14 @@ class GPT(nn.Module):
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        mtp_head_params = list(self.mtp_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=mtp_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
@@ -418,9 +423,18 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
-        if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-        return logits
+        if targets is None:
+            return logits
+
+        lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        mtp_targets = torch.cat([targets[:, 1:], targets.new_full((B, 1), -1)], dim=1)
+        mtp_logits = self.mtp_head(x)[..., :self.config.vocab_size].float()
+        mtp_logits = 15 * torch.tanh(mtp_logits / 15)
+        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), mtp_targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction != 'mean':
+            return lm_loss, mtp_loss
+        loss = lm_loss + MTP_WEIGHT * mtp_loss
+        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -668,27 +682,50 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_mtp_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
+    total_mtp_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_mtp_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
+    total_mtp_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none').view(-1)
+        loss2d, mtp_loss2d = model(x, y, loss_reduction='none')
+        loss2d = loss2d.view(-1)
+        mtp_loss2d = mtp_loss2d.view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
         total_tokens += mask.sum()
-        num_bytes2d = token_bytes[y]
+        num_bytes2d = token_bytes[y.clamp_min(0)] * mask
         total_nats += (loss2d * (num_bytes2d > 0)).sum()
         total_bytes += num_bytes2d.sum()
+        mtp_y = torch.cat([y.view(x.size(0), -1)[:, 1:], y.new_full((x.size(0), 1), -1)], dim=1).view(-1)
+        mtp_mask = mtp_y != -1
+        total_mtp_loss += mtp_loss2d[mtp_mask].sum()
+        total_mtp_tokens += mtp_mask.sum()
+        mtp_num_bytes2d = token_bytes[mtp_y.clamp_min(0)]
+        mtp_num_bytes2d = mtp_num_bytes2d * mtp_mask
+        total_mtp_nats += (mtp_loss2d * (mtp_num_bytes2d > 0)).sum()
+        total_mtp_bytes += mtp_num_bytes2d.sum()
     if dist.is_initialized():
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_mtp_nats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_mtp_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_mtp_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_mtp_tokens, op=dist.ReduceOp.SUM)
     total_nats, total_bytes = total_nats.item(), total_bytes.item()
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
+    total_mtp_nats, total_mtp_bytes = total_mtp_nats.item(), total_mtp_bytes.item()
+    total_mtp_loss, total_mtp_tokens = total_mtp_loss.item(), total_mtp_tokens.item()
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
-    return bpb, loss
+    mtp_bpb = total_mtp_nats / (math.log(2) * total_mtp_bytes) if total_mtp_bytes > 0 else float('inf')
+    mtp_loss = total_mtp_loss / total_mtp_tokens if total_mtp_tokens > 0 else float('inf')
+    weighted_loss = loss + MTP_WEIGHT * mtp_loss
+    return bpb, loss, mtp_bpb, mtp_loss, weighted_loss
 
 # =============================================================================
 # Training
@@ -746,6 +783,7 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  mtp_weight={MTP_WEIGHT}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -773,9 +811,10 @@ param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
-other_params = param_counts - transformer_params - ve_params - lm_head_params
+mtp_head_params = sum(p.numel() for p in model.mtp_head.parameters())
+other_params = param_counts - transformer_params - ve_params - lm_head_params - mtp_head_params
 num_flops_per_token = model.estimate_flops()
-print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, other: {other_params:,})")
+print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, mtp_head: {mtp_head_params:,}, other: {other_params:,})")
 print0(f"FLOPs per token: {num_flops_per_token:e}")
 
 # Compile
@@ -824,6 +863,8 @@ min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
+smooth_train_main_loss = 0
+smooth_train_mtp_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 steps_per_epoch = num_iterations / args.num_epochs
@@ -838,9 +879,9 @@ late_ckpt_paths = []
 model.eval()
 val_loader = build_val_loader()
 with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+    val_bpb, val_loss, val_mtp_bpb, val_mtp_loss, val_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | MTP BPB: {val_mtp_bpb:.6f} | MTP Loss: {val_mtp_loss:.6f} | Total Loss: {val_total_loss:.6f}")
+wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss, "val/mtp_bpb": val_mtp_bpb, "val/mtp_loss": val_mtp_loss, "val/total_loss": val_total_loss})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
@@ -851,8 +892,10 @@ while current_epoch <= args.num_epochs:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, metrics = model(x, y)
         train_loss = loss.detach()
+        train_main_loss = metrics["lm_loss"].detach()
+        train_mtp_loss = metrics["mtp_loss"].detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
@@ -893,7 +936,11 @@ while current_epoch <= args.num_epochs:
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    smooth_train_main_loss = ema_beta * smooth_train_main_loss + (1 - ema_beta) * train_main_loss.item()
+    smooth_train_mtp_loss = ema_beta * smooth_train_mtp_loss + (1 - ema_beta) * train_mtp_loss.item()
     debiased = smooth_train_loss / (1 - ema_beta**step)
+    debiased_main = smooth_train_main_loss / (1 - ema_beta**step)
+    debiased_mtp = smooth_train_mtp_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
@@ -901,8 +948,8 @@ while current_epoch <= args.num_epochs:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | main: {debiased_main:.6f} | mtp: {debiased_mtp:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    wandb_run.log({"step": step, "train/loss": debiased, "train/main_loss": debiased_main, "train/mtp_loss": debiased_mtp, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -915,9 +962,9 @@ while current_epoch <= args.num_epochs:
         model.eval()
         val_loader = build_val_loader()
         with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            val_bpb, val_loss, val_mtp_bpb, val_mtp_loss, val_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | MTP BPB: {val_mtp_bpb:.6f} | MTP Loss: {val_mtp_loss:.6f} | Total Loss: {val_total_loss:.6f}")
+        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss, "val/mtp_bpb": val_mtp_bpb, "val/mtp_loss": val_mtp_loss, "val/total_loss": val_total_loss})
         # Save checkpoint for weight averaging
         ckpt_path = os.path.join("tiny_ckpts", f"epoch_{current_epoch:03d}.pt")
         if master_process:
@@ -956,11 +1003,14 @@ if ema_params is not None:
                 p.copy_(ema * correction)
         val_loader = build_val_loader()
         with autocast_ctx:
-            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
+            ema_bpb, ema_loss, ema_mtp_bpb, ema_mtp_loss, ema_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f} | MTP BPB: {ema_mtp_bpb:.6f} | MTP Loss: {ema_mtp_loss:.6f} | Total Loss: {ema_total_loss:.6f}")
+        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss, "val/ema_mtp_bpb": ema_mtp_bpb, "val/ema_mtp_loss": ema_mtp_loss, "val/ema_total_loss": ema_total_loss})
         val_bpb = ema_bpb
         val_loss = ema_loss
+        val_mtp_bpb = ema_mtp_bpb
+        val_mtp_loss = ema_mtp_loss
+        val_total_loss = ema_total_loss
         if ema_bpb < min_val_bpb:
             min_val_bpb = ema_bpb
             min_val_loss = ema_loss
@@ -983,11 +1033,14 @@ if len(late_ckpt_paths) >= 2:
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+        avg_bpb, avg_loss, avg_mtp_bpb, avg_mtp_loss, avg_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} | MTP BPB: {avg_mtp_bpb:.6f} | MTP Loss: {avg_mtp_loss:.6f} | Total Loss: {avg_total_loss:.6f}")
+    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss, "ckpt_avg/mtp_bpb": avg_mtp_bpb, "ckpt_avg/mtp_loss": avg_mtp_loss, "ckpt_avg/total_loss": avg_total_loss})
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
+        val_loss, val_bpb = avg_loss, avg_bpb
+        val_mtp_loss, val_mtp_bpb = avg_mtp_loss, avg_mtp_bpb
+        val_total_loss = avg_total_loss
 
 # Summary
 wall_clock_time = time.time() - wall_clock_start
@@ -995,10 +1048,16 @@ print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
+final_train_main_loss = smooth_train_main_loss / (1 - 0.9**step) if step > 0 else float('inf')
+final_train_mtp_loss = smooth_train_mtp_loss / (1 - 0.9**step) if step > 0 else float('inf')
 print0(f"Final train loss: {final_train_loss:.6f}")
+print0(f"Final train main loss: {final_train_main_loss:.6f}")
+print0(f"Final train MTP loss: {final_train_mtp_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
+wandb_run.summary["final_train_main_loss"] = final_train_main_loss
+wandb_run.summary["final_train_mtp_loss"] = final_train_mtp_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
 if args.save_result and master_process:
@@ -1007,6 +1066,8 @@ if args.save_result and master_process:
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
         "val_loss": val_loss,
+        "val_mtp_loss": val_mtp_loss,
+        "val_total_loss": val_total_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
