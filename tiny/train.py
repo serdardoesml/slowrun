@@ -36,7 +36,7 @@ _script_start = time.time()
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=32)
+parser.add_argument("--device-batch-size", type=int, default=16)
 parser.add_argument("--num-epochs", type=int, default=16)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
@@ -69,6 +69,8 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--mtp-weight", type=float, default=0.3,
+                    help="Linear multi-token prediction weight (0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,7 +110,7 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
-MTP_WEIGHT = 0.3
+MTP_WEIGHT = args.mtp_weight
 
 # =============================================================================
 # Utilities
@@ -287,7 +289,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
-        self.mtp_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        if MTP_WEIGHT > 0:
+            self.mtp_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
@@ -305,7 +308,8 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        torch.nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.001)
+        if MTP_WEIGHT > 0:
+            torch.nn.init.normal_(self.mtp_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -381,7 +385,8 @@ class GPT(nn.Module):
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        lm_head_params += list(self.mtp_head.parameters())
+        if MTP_WEIGHT > 0:
+            lm_head_params += list(self.mtp_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
@@ -428,6 +433,8 @@ class GPT(nn.Module):
         lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
             return lm_loss
+        if MTP_WEIGHT <= 0:
+            return lm_loss, {'lm_loss': lm_loss}
 
         mtp_logits = self.mtp_head(x[:, :-1])[..., :self.config.vocab_size].float()
         mtp_logits = 15 * torch.tanh(mtp_logits / 15)
@@ -787,7 +794,7 @@ param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
-mtp_head_params = sum(p.numel() for p in model.mtp_head.parameters())
+mtp_head_params = sum(p.numel() for p in model.mtp_head.parameters()) if MTP_WEIGHT > 0 else 0
 other_params = param_counts - transformer_params - ve_params - lm_head_params - mtp_head_params
 num_flops_per_token = model.estimate_flops()
 print0(f"Parameters: {param_counts:,} (transformer: {transformer_params:,}, value_embeds: {ve_params:,}, lm_head: {lm_head_params:,}, mtp_head: {mtp_head_params:,}, other: {other_params:,})")
