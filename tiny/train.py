@@ -427,12 +427,12 @@ class GPT(nn.Module):
             return logits
 
         lm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-        mtp_targets = torch.cat([targets[:, 1:], targets.new_full((B, 1), -1)], dim=1)
-        mtp_logits = self.mtp_head(x)[..., :self.config.vocab_size].float()
-        mtp_logits = 15 * torch.tanh(mtp_logits / 15)
-        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), mtp_targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
-            return lm_loss, mtp_loss
+            return lm_loss
+
+        mtp_logits = self.mtp_head(x[:, :-1])[..., :self.config.vocab_size].float()
+        mtp_logits = 15 * torch.tanh(mtp_logits / 15)
+        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), targets[:, 1:].reshape(-1), ignore_index=-1)
         loss = lm_loss + MTP_WEIGHT * mtp_loss
         return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
 
@@ -682,16 +682,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
-    total_mtp_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_mtp_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
-    total_mtp_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_mtp_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
-        loss2d, mtp_loss2d = model(x, y, loss_reduction='none')
-        loss2d = loss2d.view(-1)
-        mtp_loss2d = mtp_loss2d.view(-1)
+        loss2d = model(x, y, loss_reduction='none').view(-1)
         y = y.view(-1)
         mask = y != -1
         total_loss += loss2d[mask].sum()
@@ -699,33 +693,16 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         num_bytes2d = token_bytes[y.clamp_min(0)] * mask
         total_nats += (loss2d * (num_bytes2d > 0)).sum()
         total_bytes += num_bytes2d.sum()
-        mtp_y = torch.cat([y.view(x.size(0), -1)[:, 1:], y.new_full((x.size(0), 1), -1)], dim=1).view(-1)
-        mtp_mask = mtp_y != -1
-        total_mtp_loss += mtp_loss2d[mtp_mask].sum()
-        total_mtp_tokens += mtp_mask.sum()
-        mtp_num_bytes2d = token_bytes[mtp_y.clamp_min(0)]
-        mtp_num_bytes2d = mtp_num_bytes2d * mtp_mask
-        total_mtp_nats += (mtp_loss2d * (mtp_num_bytes2d > 0)).sum()
-        total_mtp_bytes += mtp_num_bytes2d.sum()
     if dist.is_initialized():
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_mtp_nats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_mtp_bytes, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_mtp_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_mtp_tokens, op=dist.ReduceOp.SUM)
     total_nats, total_bytes = total_nats.item(), total_bytes.item()
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
-    total_mtp_nats, total_mtp_bytes = total_mtp_nats.item(), total_mtp_bytes.item()
-    total_mtp_loss, total_mtp_tokens = total_mtp_loss.item(), total_mtp_tokens.item()
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
-    mtp_bpb = total_mtp_nats / (math.log(2) * total_mtp_bytes) if total_mtp_bytes > 0 else float('inf')
-    mtp_loss = total_mtp_loss / total_mtp_tokens if total_mtp_tokens > 0 else float('inf')
-    weighted_loss = loss + MTP_WEIGHT * mtp_loss
-    return bpb, loss, mtp_bpb, mtp_loss, weighted_loss
+    return bpb, loss
 
 # =============================================================================
 # Training
@@ -879,9 +856,9 @@ late_ckpt_paths = []
 model.eval()
 val_loader = build_val_loader()
 with autocast_ctx:
-    val_bpb, val_loss, val_mtp_bpb, val_mtp_loss, val_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | MTP BPB: {val_mtp_bpb:.6f} | MTP Loss: {val_mtp_loss:.6f} | Total Loss: {val_total_loss:.6f}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss, "val/mtp_bpb": val_mtp_bpb, "val/mtp_loss": val_mtp_loss, "val/total_loss": val_total_loss})
+    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
@@ -927,8 +904,9 @@ while current_epoch <= args.num_epochs:
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
-    train_loss_f = train_loss.item()
+    train_metric_values = torch.stack([train_loss, train_main_loss, train_mtp_loss])
     synchronize()
+    train_loss_f, train_main_loss_f, train_mtp_loss_f = train_metric_values.tolist()
     dt = time.time() - t0
 
     step += 1
@@ -936,8 +914,8 @@ while current_epoch <= args.num_epochs:
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    smooth_train_main_loss = ema_beta * smooth_train_main_loss + (1 - ema_beta) * train_main_loss.item()
-    smooth_train_mtp_loss = ema_beta * smooth_train_mtp_loss + (1 - ema_beta) * train_mtp_loss.item()
+    smooth_train_main_loss = ema_beta * smooth_train_main_loss + (1 - ema_beta) * train_main_loss_f
+    smooth_train_mtp_loss = ema_beta * smooth_train_mtp_loss + (1 - ema_beta) * train_mtp_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
     debiased_main = smooth_train_main_loss / (1 - ema_beta**step)
     debiased_mtp = smooth_train_mtp_loss / (1 - ema_beta**step)
@@ -962,9 +940,9 @@ while current_epoch <= args.num_epochs:
         model.eval()
         val_loader = build_val_loader()
         with autocast_ctx:
-            val_bpb, val_loss, val_mtp_bpb, val_mtp_loss, val_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f} | MTP BPB: {val_mtp_bpb:.6f} | MTP Loss: {val_mtp_loss:.6f} | Total Loss: {val_total_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss, "val/mtp_bpb": val_mtp_bpb, "val/mtp_loss": val_mtp_loss, "val/total_loss": val_total_loss})
+            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
         # Save checkpoint for weight averaging
         ckpt_path = os.path.join("tiny_ckpts", f"epoch_{current_epoch:03d}.pt")
         if master_process:
@@ -1003,14 +981,11 @@ if ema_params is not None:
                 p.copy_(ema * correction)
         val_loader = build_val_loader()
         with autocast_ctx:
-            ema_bpb, ema_loss, ema_mtp_bpb, ema_mtp_loss, ema_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f} | MTP BPB: {ema_mtp_bpb:.6f} | MTP Loss: {ema_mtp_loss:.6f} | Total Loss: {ema_total_loss:.6f}")
-        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss, "val/ema_mtp_bpb": ema_mtp_bpb, "val/ema_mtp_loss": ema_mtp_loss, "val/ema_total_loss": ema_total_loss})
+            ema_bpb, ema_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"EMA Val BPB: {ema_bpb:.6f} | EMA Val Loss: {ema_loss:.6f}")
+        wandb_run.log({"step": step, "val/ema_bpb": ema_bpb, "val/ema_loss": ema_loss})
         val_bpb = ema_bpb
         val_loss = ema_loss
-        val_mtp_bpb = ema_mtp_bpb
-        val_mtp_loss = ema_mtp_loss
-        val_total_loss = ema_total_loss
         if ema_bpb < min_val_bpb:
             min_val_bpb = ema_bpb
             min_val_loss = ema_loss
@@ -1033,14 +1008,12 @@ if len(late_ckpt_paths) >= 2:
     model.eval()
     val_loader = build_val_loader()
     with autocast_ctx:
-        avg_bpb, avg_loss, avg_mtp_bpb, avg_mtp_loss, avg_total_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f} | MTP BPB: {avg_mtp_bpb:.6f} | MTP Loss: {avg_mtp_loss:.6f} | Total Loss: {avg_total_loss:.6f}")
-    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss, "ckpt_avg/mtp_bpb": avg_mtp_bpb, "ckpt_avg/mtp_loss": avg_mtp_loss, "ckpt_avg/total_loss": avg_total_loss})
+        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
+    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
     if avg_loss < min_val_loss:
         min_val_loss, min_val_bpb = avg_loss, avg_bpb
         val_loss, val_bpb = avg_loss, avg_bpb
-        val_mtp_loss, val_mtp_bpb = avg_mtp_loss, avg_mtp_bpb
-        val_total_loss = avg_total_loss
 
 # Summary
 wall_clock_time = time.time() - wall_clock_start
@@ -1066,8 +1039,6 @@ if args.save_result and master_process:
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
         "val_loss": val_loss,
-        "val_mtp_loss": val_mtp_loss,
-        "val_total_loss": val_total_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
     }
