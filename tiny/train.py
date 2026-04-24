@@ -381,14 +381,13 @@ class GPT(nn.Module):
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        mtp_head_params = list(self.mtp_head.parameters())
+        lm_head_params += list(self.mtp_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=mtp_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
@@ -840,8 +839,6 @@ min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
-smooth_train_main_loss = 0
-smooth_train_mtp_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 steps_per_epoch = num_iterations / args.num_epochs
@@ -871,8 +868,6 @@ while current_epoch <= args.num_epochs:
         with autocast_ctx:
             loss, metrics = model(x, y)
         train_loss = loss.detach()
-        train_main_loss = metrics["lm_loss"].detach()
-        train_mtp_loss = metrics["mtp_loss"].detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
@@ -904,9 +899,8 @@ while current_epoch <= args.num_epochs:
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
-    train_metric_values = torch.stack([train_loss, train_main_loss, train_mtp_loss])
+    train_loss_f = train_loss.item()
     synchronize()
-    train_loss_f, train_main_loss_f, train_mtp_loss_f = train_metric_values.tolist()
     dt = time.time() - t0
 
     step += 1
@@ -914,11 +908,7 @@ while current_epoch <= args.num_epochs:
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    smooth_train_main_loss = ema_beta * smooth_train_main_loss + (1 - ema_beta) * train_main_loss_f
-    smooth_train_mtp_loss = ema_beta * smooth_train_mtp_loss + (1 - ema_beta) * train_mtp_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
-    debiased_main = smooth_train_main_loss / (1 - ema_beta**step)
-    debiased_mtp = smooth_train_mtp_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
@@ -926,8 +916,10 @@ while current_epoch <= args.num_epochs:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | main: {debiased_main:.6f} | mtp: {debiased_mtp:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/main_loss": debiased_main, "train/mtp_loss": debiased_mtp, "train/mfu": mfu})
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    log_data = {"step": step, "train/loss": debiased, "train/mfu": mfu}
+    log_data.update({f"train/{k}": v.item() for k, v in metrics.items()})
+    wandb_run.log(log_data)
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1021,16 +1013,10 @@ print0(f"Wall clock time: {wall_clock_time/60:.2f}m")
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 final_train_loss = smooth_train_loss / (1 - 0.9**step) if step > 0 else float('inf')
-final_train_main_loss = smooth_train_main_loss / (1 - 0.9**step) if step > 0 else float('inf')
-final_train_mtp_loss = smooth_train_mtp_loss / (1 - 0.9**step) if step > 0 else float('inf')
 print0(f"Final train loss: {final_train_loss:.6f}")
-print0(f"Final train main loss: {final_train_main_loss:.6f}")
-print0(f"Final train MTP loss: {final_train_mtp_loss:.6f}")
 print0(f"Min val BPB: {min_val_bpb:.6f}")
 print0(f"Min val Loss: {min_val_loss:.6f}")
 wandb_run.summary["final_train_loss"] = final_train_loss
-wandb_run.summary["final_train_main_loss"] = final_train_main_loss
-wandb_run.summary["final_train_mtp_loss"] = final_train_mtp_loss
 wandb_run.summary["best_val_loss"] = min_val_loss
 
 if args.save_result and master_process:
