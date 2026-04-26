@@ -25,6 +25,16 @@ Min val BPB: 1.070614
 Min val Loss: 3.294537
 Total wall time: 4029.10s (67.15m)
 
+## Unlimited:
+Added a scaled up version with 2b total parameters repeating without schedule to depth 48, with a lighter version of mtp using only a mtp lm_head, no mtp block. Also reduced batch size and adjusted lr and wd accordingly. Trying to get it to a point where together with ensembling and chain distillation it could be competitive in the unlimited track.
+
+## Unlimited training summary:
+Total training time: 814.01m
+Final train loss: 3.933960
+Min val BPB: 1.040571
+Min val Loss: 3.201859
+Total wall time: 51953.06s (865.88m)
+
 ## More on the universal transformer
 Introduced by Google back in 2019 (https://arxiv.org/pdf/1807.03819). They also made a recursive version of BERT called ALBERT for parameter efficiency back in 2020. (https://arxiv.org/pdf/1909.11942)
 
