@@ -35,7 +35,7 @@ wallclock_start = time.time()
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-parser.add_argument("--device-batch-size", type=int, default=4)
+parser.add_argument("--device-batch-size", type=int, default=2)
 parser.add_argument("--num-epochs", type=int, default=12) 
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
@@ -1058,6 +1058,7 @@ transformer_params = (
     + sum(p.numel() for p in model.decoder_attns.parameters())
     + sum(p.numel() for p in model.encoder_mlp.parameters())
     + sum(p.numel() for p in model.decoder_mlp.parameters())
+    + sum(p.numel() for p in model.depth_attns.parameters())
 )
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
 lm_head_params = sum(p.numel() for p in model.lm_head.parameters())
