@@ -308,6 +308,26 @@ class SharedMLP(nn.Module):
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
+class DepthAttentionResidual(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_k = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_v = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.gate = nn.Parameter(torch.tensor(-4.0))
+        self.scale = config.n_embd ** -0.5
+
+    def forward(self, x, states):
+        mem = torch.stack(states, dim=2)
+        q = self.c_q(x).unsqueeze(2)
+        k = self.c_k(mem)
+        v = self.c_v(mem)
+        att = (q.float() * k.float()).sum(dim=-1) * self.scale
+        w = F.softmax(att, dim=-1).to(v.dtype)
+        y = (w.unsqueeze(-1) * v).sum(dim=2)
+        return torch.sigmoid(self.gate).to(y.dtype) * self.c_proj(y)
+
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -346,6 +366,7 @@ class GPT(nn.Module):
         self.decoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
         self.encoder_mlp = SharedMLP(config)
         self.decoder_mlp = SharedMLP(config)
+        self.depth_attns = nn.ModuleList([DepthAttentionResidual(config) for _ in range(config.n_layer)])
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
             "h": nn.ModuleList([LayerBlock(config, i) for i in range(config.n_layer)]),
@@ -383,6 +404,12 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(mlp.c_proj.weight)
+        for depth_attn in self.depth_attns:
+            torch.nn.init.uniform_(depth_attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(depth_attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(depth_attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(depth_attn.c_proj.weight)
+            depth_attn.gate.fill_(-4.0)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -448,15 +475,17 @@ class GPT(nn.Module):
         shared_attn = sum(p.numel() for p in self.encoder_attns.parameters()) + sum(p.numel() for p in self.decoder_attns.parameters())
         shared_mlp = sum(p.numel() for p in self.encoder_mlp.parameters()) + sum(p.numel() for p in self.decoder_mlp.parameters())
         active_layers = list(range(self.active_encoder_layers)) + list(range(self.active_decoder_start, self.max_n_layer))
+        active_depth_attn_params = sum(p.numel() for i in active_layers for p in self.depth_attns[i].parameters())
         nparams = (
             self.transformer.wte.weight.numel()
             + self.lm_head.weight.numel()
             + self.active_encoder_layers * (shared_attn + shared_mlp)
+            + active_depth_attn_params
             + sum(p.numel() for i in active_layers for p in self.transformer.h[i].parameters())
             + sum(p.numel() for i in active_layers if str(i) in self.ve_projs for p in self.ve_projs[str(i)].parameters())
             + 3 * self.active_encoder_layers
         )
-        nparams_exclude = self.transformer.wte.weight.numel() + 3 * self.active_encoder_layers
+        nparams_exclude = self.transformer.wte.weight.numel() + 3 * self.active_encoder_layers + len(active_layers)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         attn_flops = sum(
             12 * h * q * self._avg_causal_attended_keys(self.window_sizes[i][0], t)
@@ -486,6 +515,9 @@ class GPT(nn.Module):
             + list(self.encoder_mlp.parameters())
             + list(self.decoder_mlp.parameters())
         )
+        depth_gate_params = [m.gate for m in self.depth_attns]
+        depth_gate_ids = {id(p) for p in depth_gate_params}
+        depth_matrix_params = [p for p in self.depth_attns.parameters() if id(p) not in depth_gate_ids]
         layer_matrix_params = []
         norm_params = []
         for block in self.transformer.h:
@@ -498,7 +530,7 @@ class GPT(nn.Module):
             for ve_gate in block.ve_gates:
                 if isinstance(ve_gate, nn.Linear):
                     layer_matrix_params.append(ve_gate.weight)
-        matrix_params = [p for p in shared_params if id(p) not in iha_param_ids] + layer_matrix_params + list(self.ve_projs.parameters())
+        matrix_params = [p for p in shared_params if id(p) not in iha_param_ids] + depth_matrix_params + layer_matrix_params + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -514,6 +546,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=depth_gate_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
         if iha_params:
             param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
@@ -527,9 +560,11 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp):
+    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp, depth_states):
         block = self.transformer.h[layer_idx]
         x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
+        if depth_states:
+            x = x + self.depth_attns[layer_idx](rms_norm(x), depth_states)
         ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
         x_in = x
         for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
@@ -549,14 +584,15 @@ class GPT(nn.Module):
             x = x_in + keep * (x - x_in)
         return x
 
-    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, depth_states, start, end):
         """Run decoder layers [start, end), with U-Net skip connections."""
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.max_n_layer - 1 - i
             if 0 <= j < len(encoder_outputs):
                 x = x + self.skip_weights[i - self.max_encoder_layers] * encoder_outputs[j]
-            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attns, self.decoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attns, self.decoder_mlp, depth_states)
+            depth_states.append(x)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -567,12 +603,14 @@ class GPT(nn.Module):
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
+        depth_states = []
         for i in range(self.active_encoder_layers):
-            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attns, self.encoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attns, self.encoder_mlp, depth_states)
             encoder_outputs.append(x)
+            depth_states.append(x)
 
         # Decoder half
-        x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
+        x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs, depth_states,
                                      self.active_decoder_start, self.max_n_layer)
 
         x = rms_norm(x)
