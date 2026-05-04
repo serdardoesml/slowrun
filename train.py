@@ -48,6 +48,8 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.3)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
+parser.add_argument("--save", action="store_true",
+                    help="Save best eval artifact to runs/<run-name>/model.pt")
 parser.add_argument("--n_layer", type=int, default=30)
 parser.add_argument("--n_head", type=int, default=14)
 parser.add_argument("--n_embd", type=int, default=1792)
@@ -986,6 +988,7 @@ stdout_orig = sys.stdout
 stderr_orig = sys.stderr
 artifacts_log_f = None
 result_path = os.path.join(run_dir, "result.json")
+artifact_model_path = os.path.join(run_dir, "model.pt")
 if master_process:
     os.makedirs(checkpoints_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "wandb"), exist_ok=True)
@@ -1015,6 +1018,8 @@ print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
+if args.save:
+    print0(f"  save_artifact={artifact_model_path}")
 if args.iha:
     print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
@@ -1054,6 +1059,55 @@ print0(f"FLOPs per token: {num_flops_per_token:e}")
 # Compile
 orig_model = model
 model = torch.compile(model, dynamic=False)
+
+
+def model_state_dict_cpu():
+    return {name: p.data.float().cpu() for name, p in orig_model.named_parameters()}
+
+
+def save_single_model_artifact(label, val_bpb, val_loss, step, epoch):
+    if not args.save or not master_process:
+        return
+    artifact = {
+        "format": "slowrun_eval_artifact_v1",
+        "artifact_type": "single_model",
+        "eval_method": "single_model",
+        "selection": label,
+        "step": step,
+        "epoch": epoch,
+        "val_bpb": val_bpb,
+        "val_loss": val_loss,
+        "model_config": dict(config.__dict__),
+        "state_dict": model_state_dict_cpu(),
+    }
+    torch.save(artifact, artifact_model_path)
+    print0(f"Saved eval artifact to {artifact_model_path} ({label}, val_loss={val_loss:.6f})")
+
+
+def save_logit_ensemble_artifact(label, ckpt_paths, weights, val_bpb, val_loss, step):
+    if not args.save or not master_process:
+        return
+    checkpoints = []
+    for path in ckpt_paths:
+        checkpoints.append({
+            "path": path,
+            "state_dict": torch.load(path, map_location="cpu", weights_only=True),
+        })
+    artifact = {
+        "format": "slowrun_eval_artifact_v1",
+        "artifact_type": "logit_ensemble",
+        "eval_method": "probability_average",
+        "selection": label,
+        "step": step,
+        "val_bpb": val_bpb,
+        "val_loss": val_loss,
+        "model_config": dict(config.__dict__),
+        "ensemble_weights": list(weights),
+        "checkpoints": checkpoints,
+    }
+    torch.save(artifact, artifact_model_path)
+    print0(f"Saved eval artifact to {artifact_model_path} ({label}, val_loss={val_loss:.6f})")
+
 
 # Optimizer
 optimizer = model.setup_optimizer()
@@ -1108,6 +1162,7 @@ def get_wd_multiplier(it):
 
 # Training loop
 step = 0
+val_loss = float("inf")
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
@@ -1137,6 +1192,7 @@ else:
     wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
     min_val_bpb = val_bpb
     min_val_loss = val_loss
+    save_single_model_artifact("initial_val", val_bpb, val_loss, step, 0)
     model.train()
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
@@ -1219,6 +1275,7 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
             min_val_bpb = val_bpb
             min_val_loss = val_loss
             epochs_without_improvement = 0
+            save_single_model_artifact("best_val", val_bpb, val_loss, step, current_epoch)
         else:
             epochs_without_improvement += 1
             if args.patience >= 0 and epochs_without_improvement >= args.patience:
@@ -1285,12 +1342,14 @@ if logit_avg_count > 0:
             eq_bpb, eq_loss = _run_mode("equal", equal_w)
             if eq_loss < min_val_loss:
                 min_val_loss, min_val_bpb = eq_loss, eq_bpb
+                save_logit_ensemble_artifact("logit_avg_equal", ckpt_paths_for_logit, equal_w, eq_bpb, eq_loss, step)
                 print0(f"  ** New best! (logit avg equal weights)")
 
         if args.logit_avg_mode in ("weighted", "both"):
             wt_bpb, wt_loss = _run_mode("weighted", weighted_w)
             if wt_loss < min_val_loss:
                 min_val_loss, min_val_bpb = wt_loss, wt_bpb
+                save_logit_ensemble_artifact("logit_avg_weighted", ckpt_paths_for_logit, weighted_w, wt_bpb, wt_loss, step)
                 print0(f"  ** New best! (logit avg recency weights)")
 
 
@@ -1312,6 +1371,7 @@ if master_process:
         "num_epochs": args.num_epochs,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
+        "model_path": artifact_model_path if args.save else None,
         "wandb_url": getattr(wandb_run, "url", None),
     }
     with open(_result_out, "w") as f:
