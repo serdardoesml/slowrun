@@ -28,6 +28,8 @@ from torch import Tensor
 import wandb
 import tiktoken
 import numpy as np
+import triton
+import triton.language as tl
 
 wallclock_start = time.time()
 
@@ -315,6 +317,111 @@ class SharedMLP(nn.Module):
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
+@triton.jit
+def _butterfly_forward_kernel(x, y, theta, n_rows, stage,
+                              D: tl.constexpr, HALF: tl.constexpr,
+                              BLOCK_M: tl.constexpr, BLOCK_P: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    pair_offsets = tl.program_id(1) * BLOCK_P + tl.arange(0, BLOCK_P)
+    pairs = pair_offsets[None, :]
+    pair_mask = pair_offsets < (D // 2)
+    row_mask = rows < n_rows
+    inner = pairs % HALF
+    group = pairs // HALF
+    i0 = group * (2 * HALF) + inner
+    i1 = i0 + HALF
+    mask = row_mask & pair_mask
+    theta_vals = tl.load(theta + stage * (D // 2) + pairs, mask=pair_mask, other=0.0)
+    c = tl.cos(theta_vals)
+    s = tl.sin(theta_vals)
+    a = tl.load(x + rows * D + i0, mask=mask, other=0.0)
+    b = tl.load(x + rows * D + i1, mask=mask, other=0.0)
+    tl.store(y + rows * D + i0, a * c - b * s, mask=mask)
+    tl.store(y + rows * D + i1, a * s + b * c, mask=mask)
+
+@triton.jit
+def _butterfly_backward_kernel(y, gy, x_prev, gx_prev, theta, gtheta,
+                               n_rows, stage,
+                               D: tl.constexpr, HALF: tl.constexpr,
+                               BLOCK_M: tl.constexpr, BLOCK_P: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    pair_offsets = tl.program_id(1) * BLOCK_P + tl.arange(0, BLOCK_P)
+    pairs = pair_offsets[None, :]
+    pair_mask = pair_offsets < (D // 2)
+    row_mask = rows < n_rows
+    inner = pairs % HALF
+    group = pairs // HALF
+    i0 = group * (2 * HALF) + inner
+    i1 = i0 + HALF
+    mask = row_mask & pair_mask
+    theta_vals = tl.load(theta + stage * (D // 2) + pairs, mask=pair_mask, other=0.0)
+    c = tl.cos(theta_vals)
+    s = tl.sin(theta_vals)
+    y0 = tl.load(y + rows * D + i0, mask=mask, other=0.0)
+    y1 = tl.load(y + rows * D + i1, mask=mask, other=0.0)
+    gy0 = tl.load(gy + rows * D + i0, mask=mask, other=0.0)
+    gy1 = tl.load(gy + rows * D + i1, mask=mask, other=0.0)
+    tl.store(x_prev + rows * D + i0, y0 * c + y1 * s, mask=mask)
+    tl.store(x_prev + rows * D + i1, -y0 * s + y1 * c, mask=mask)
+    tl.store(gx_prev + rows * D + i0, gy0 * c + gy1 * s, mask=mask)
+    tl.store(gx_prev + rows * D + i1, -gy0 * s + gy1 * c, mask=mask)
+    dtheta = tl.sum(-gy0.to(tl.float32) * y1.to(tl.float32) + gy1.to(tl.float32) * y0.to(tl.float32), axis=0)
+    tl.atomic_add(gtheta + stage * (D // 2) + pair_offsets, dtheta, sem="relaxed", mask=pair_mask)
+
+class _ButterflyFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, theta, dim, log_dim, num_stages):
+        ctx.dim = dim
+        ctx.log_dim = log_dim
+        ctx.num_stages = num_stages
+        assert x.device.type == "cuda", "OrthogonalButterfly requires the Triton CUDA kernel"
+        shape = x.shape
+        n_rows = x.numel() // dim
+        src = x.contiguous().reshape(n_rows, dim)
+        a = torch.empty_like(src)
+        b = torch.empty_like(src)
+        dst = a
+        for stage_idx in range(num_stages):
+            half = 1 << (stage_idx % log_dim)
+            grid = (triton.cdiv(n_rows, 16), triton.cdiv(dim // 2, 64))
+            _butterfly_forward_kernel[grid](
+                src, dst, theta, n_rows, stage_idx, D=dim, HALF=half,
+                BLOCK_M=16, BLOCK_P=64
+            )
+            src, dst = dst, b if dst is a else a
+        y = src.reshape(shape)
+        ctx.save_for_backward(y, theta)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        out, theta = ctx.saved_tensors
+        dim, log_dim, num_stages = ctx.dim, ctx.log_dim, ctx.num_stages
+        assert grad_out.device.type == "cuda", "OrthogonalButterfly requires the Triton CUDA kernel"
+        shape = out.shape
+        n_rows = out.numel() // dim
+        act = out.contiguous().reshape(n_rows, dim)
+        grad = grad_out.contiguous().reshape(n_rows, dim)
+        act_a, act_b = torch.empty_like(act), torch.empty_like(act)
+        grad_a, grad_b = torch.empty_like(grad), torch.empty_like(grad)
+        grad_theta = torch.zeros_like(theta)
+        act_dst, grad_dst = act_a, grad_a
+        for stage_idx in range(num_stages - 1, -1, -1):
+            half = 1 << (stage_idx % log_dim)
+            grid = (triton.cdiv(n_rows, 16), triton.cdiv(dim // 2, 64))
+            _butterfly_backward_kernel[grid](
+                act, grad, act_dst, grad_dst, theta, grad_theta, n_rows, stage_idx,
+                D=dim, HALF=half, BLOCK_M=16, BLOCK_P=64
+            )
+            act, act_dst = act_dst, act_b if act_dst is act_a else act_a
+            grad, grad_dst = grad_dst, grad_b if grad_dst is grad_a else grad_a
+        grad_x = grad.reshape(shape)
+        return grad_x, grad_theta, None, None, None
+
+@torch._dynamo.disable
+def _butterfly_apply(x, theta, dim, log_dim, num_stages):
+    return _ButterflyFunction.apply(x, theta, dim, log_dim, num_stages)
+
 class OrthogonalButterfly(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -329,18 +436,7 @@ class OrthogonalButterfly(nn.Module):
         self.theta.uniform_(-math.pi, math.pi)
 
     def forward(self, x):
-        shape = x.shape
-        y = x
-        for stage_idx in range(self.num_stages):
-            half = 1 << (stage_idx % self.log_dim)
-            block = 2 * half
-            y = y.reshape(*shape[:-1], self.dim // block, block)
-            a, b = y[..., :half], y[..., half:]
-            theta = self.theta.view(self.num_stages, self.dim // 2)[stage_idx].reshape(self.dim // block, half)
-            c = theta.cos().to(dtype=x.dtype)
-            s = theta.sin().to(dtype=x.dtype)
-            y = torch.cat((a * c - b * s, a * s + b * c), dim=-1).reshape(shape)
-        return y
+        return _butterfly_apply(x, self.theta, self.dim, self.log_dim, self.num_stages)
 
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
