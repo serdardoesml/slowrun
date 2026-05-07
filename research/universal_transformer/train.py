@@ -318,6 +318,8 @@ class SharedMLP(nn.Module):
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.input_rot = nn.Parameter(torch.empty(config.n_embd, config.n_embd))
+        self.output_rot = nn.Parameter(torch.empty(config.n_embd, config.n_embd))
         self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
         self.mlp_norm = RMSNorm(config.n_embd)
         head_dim = config.n_embd // config.n_head
@@ -395,6 +397,8 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
+            torch.nn.init.orthogonal_(block.input_rot)
+            torch.nn.init.orthogonal_(block.output_rot)
             for attn_norm in block.attn_norms:
                 attn_norm.weight.fill_(1.0)
                 attn_norm.bias.zero_()
@@ -496,6 +500,7 @@ class GPT(nn.Module):
         layer_matrix_params = []
         norm_params = []
         for block in self.transformer.h:
+            layer_matrix_params.extend([block.input_rot, block.output_rot])
             for attn_gate in block.attn_gates:
                 layer_matrix_params.append(attn_gate.weight)
             norm_params.extend(block.attn_norms.parameters())
@@ -542,15 +547,16 @@ class GPT(nn.Module):
         for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
             shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
         ):
-            attn_input = attn_norm(x)
+            attn_input = attn_norm(F.linear(x, block.input_rot))
             ve_gate_out = ve_gate(attn_input[..., :block.ve_gate_channels]) if isinstance(ve_gate, nn.Linear) else None
             attn_gate_out = attn_gate(attn_input[..., :block.attn_gate_channels])
-            x = x + attn(
+            attn_out = attn(
                 attn_input, ve, cos_sin, self.window_sizes[layer_idx], q_norm, k_norm,
                 ve_gate=ve_gate_out, attn_gate=attn_gate_out
             )
-        mlp_input = block.mlp_norm(x)
-        x = x + shared_mlp(mlp_input)
+            x = x + F.linear(attn_out, block.output_rot)
+        mlp_input = block.mlp_norm(F.linear(x, block.input_rot))
+        x = x + F.linear(shared_mlp(mlp_input), block.output_rot)
         if self.training and block.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= block.drop_prob).to(x.dtype)
             x = x_in + keep * (x - x_in)
