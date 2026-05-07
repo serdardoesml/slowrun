@@ -315,11 +315,38 @@ class SharedMLP(nn.Module):
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
+class OrthogonalButterfly(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        assert dim > 0 and dim & (dim - 1) == 0, "butterfly rotations require power-of-two dim"
+        self.dim = dim
+        self.log_dim = int(math.log2(dim))
+        self.num_stages = 2 * self.log_dim
+        self.theta = nn.Parameter(torch.empty(self.num_stages * dim // 2))
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        self.theta.uniform_(-math.pi, math.pi)
+
+    def forward(self, x):
+        shape = x.shape
+        y = x
+        for stage_idx in range(self.num_stages):
+            half = 1 << (stage_idx % self.log_dim)
+            block = 2 * half
+            y = y.reshape(*shape[:-1], self.dim // block, block)
+            a, b = y[..., :half], y[..., half:]
+            theta = self.theta.view(self.num_stages, self.dim // 2)[stage_idx].reshape(self.dim // block, half)
+            c = theta.cos().to(dtype=x.dtype)
+            s = theta.sin().to(dtype=x.dtype)
+            y = torch.cat((a * c - b * s, a * s + b * c), dim=-1).reshape(shape)
+        return y
+
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.input_rot = nn.Parameter(torch.empty(config.n_embd, config.n_embd))
-        self.output_rot = nn.Parameter(torch.empty(config.n_embd, config.n_embd))
+        self.input_rot = OrthogonalButterfly(config.n_embd)
+        self.output_rot = OrthogonalButterfly(config.n_embd)
         self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
         self.mlp_norm = RMSNorm(config.n_embd)
         head_dim = config.n_embd // config.n_head
@@ -397,8 +424,8 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
-            torch.nn.init.orthogonal_(block.input_rot)
-            torch.nn.init.orthogonal_(block.output_rot)
+            block.input_rot.reset_parameters()
+            block.output_rot.reset_parameters()
             for attn_norm in block.attn_norms:
                 attn_norm.weight.fill_(1.0)
                 attn_norm.bias.zero_()
@@ -497,10 +524,12 @@ class GPT(nn.Module):
             + list(self.encoder_mlp.parameters())
             + list(self.decoder_mlp.parameters())
         )
+        rotation_params = []
         layer_matrix_params = []
         norm_params = []
         for block in self.transformer.h:
-            layer_matrix_params.extend([block.input_rot, block.output_rot])
+            rotation_params.extend(block.input_rot.parameters())
+            rotation_params.extend(block.output_rot.parameters())
             for attn_gate in block.attn_gates:
                 layer_matrix_params.append(attn_gate.weight)
             norm_params.extend(block.attn_norms.parameters())
@@ -526,6 +555,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=rotation_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
         if iha_params:
             param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
@@ -547,16 +577,16 @@ class GPT(nn.Module):
         for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
             shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
         ):
-            attn_input = attn_norm(F.linear(x, block.input_rot))
+            attn_input = attn_norm(block.input_rot(x))
             ve_gate_out = ve_gate(attn_input[..., :block.ve_gate_channels]) if isinstance(ve_gate, nn.Linear) else None
             attn_gate_out = attn_gate(attn_input[..., :block.attn_gate_channels])
             attn_out = attn(
                 attn_input, ve, cos_sin, self.window_sizes[layer_idx], q_norm, k_norm,
                 ve_gate=ve_gate_out, attn_gate=attn_gate_out
             )
-            x = x + F.linear(attn_out, block.output_rot)
-        mlp_input = block.mlp_norm(F.linear(x, block.input_rot))
-        x = x + F.linear(shared_mlp(mlp_input), block.output_rot)
+            x = x + block.output_rot(attn_out)
+        mlp_input = block.mlp_norm(block.input_rot(x))
+        x = x + block.output_rot(shared_mlp(mlp_input))
         if self.training and block.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= block.drop_prob).to(x.dtype)
             x = x_in + keep * (x - x_in)
