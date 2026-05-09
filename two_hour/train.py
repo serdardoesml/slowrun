@@ -3,7 +3,7 @@ Train a language model on ~100M tokens with val loss evaluation.
 Code is based on Nanochat (https://github.com/karpathy/nanochat), with modifications to support the slowrun setting.
 
 Usage:
-    torchrun --standalone --nproc_per_node=8 train.py
+    torchrun --standalone --nproc_per_node=8 two_hour/train.py 
 """
 
 import os
@@ -87,7 +87,7 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
-parser.add_argument("--window-schedule", type=str, default="",
+parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768,1792;14-22:1280,2048",
                     help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
 args = parser.parse_args()
 args.window_schedule_spec = args.window_schedule.strip()
