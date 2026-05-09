@@ -122,6 +122,8 @@ BASE_MATRIX_LR = args.matrix_lr
 BASE_SCALAR_LR = args.scalar_lr
 BASE_EMBEDDING_LR = 0.15
 BASE_UNEMBEDDING_LR = 0.002
+AURORA_PP_ITERATIONS = 2
+AURORA_PP_BETA = 0.5
 
 # Apply LR multiplier if provided (scales all LRs uniformly)
 _lr_mult = args.lr_multiplier if args.lr_multiplier is not None else 1.0
@@ -502,7 +504,9 @@ class GPT(nn.Module):
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
-                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+                                     momentum=0.95, ns_steps=5,
+                                     pp_iterations=AURORA_PP_ITERATIONS, pp_beta=AURORA_PP_BETA,
+                                     weight_decay=WEIGHT_DECAY))
 
         optimizer = DistMuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -598,15 +602,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     bias2 = 1 - beta2_t ** step_t
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # MuonEq-R row normalization
-    g /= g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7).to(g.dtype)
-    # Polar Express orthogonalization
+def polar_express_orthogonalize(g, ns_steps):
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
@@ -617,19 +613,36 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X @ X.mT
             X = a * X + (b * A + c * (A @ A)) @ X
-    g = X
-    # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
+    return X
+
+def aurora_project(g, ns_steps, pp_iterations, pp_beta):
+    m, n = g.size(-2), g.size(-1)
+    if m == n:
+        return polar_express_orthogonalize(g, ns_steps)
+
+    transposed = m < n
+    if transposed:
+        g = g.mT
+        m, n = n, m
+
+    g32 = g.float()
+    target_row_sq = n / m
+    D = g32.norm(dim=-1, keepdim=True).clamp_min(1e-7).reciprocal()
+    for k in range(pp_iterations):
+        U = polar_express_orthogonalize(D * g32, ns_steps)
+        if k < pp_iterations - 1:
+            row_sq = U.float().square().sum(dim=-1, keepdim=True).clamp_min(1e-14)
+            D = D * (target_row_sq / row_sq).pow(pp_beta)
+
+    return U.mT if transposed else U
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused(stacked_grads, stacked_params, momentum_buffer,
+                    momentum_t, lr_t, wd_t, ns_steps, pp_iterations, pp_beta):
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    g = aurora_project(g, ns_steps, pp_iterations, pp_beta)
     # Cautious weight decay + update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
@@ -649,7 +662,6 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_momentum_t = torch.tensor(0.0)
         self._muon_lr_t = torch.tensor(0.0)
         self._muon_wd_t = torch.tensor(0.0)
-        self._muon_beta2_t = torch.tensor(0.0)
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
@@ -719,21 +731,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            s = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(s, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
         updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         if num_owned > 0:
             owned = torch.stack([params[start_idx + i] for i in range(num_owned)])
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(info['grad_chunk'][:num_owned], owned,
-                          state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                          group["ns_steps"], red_dim)
+                          state["momentum_buffer"][:num_owned],
+                          self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                          group["ns_steps"], group["pp_iterations"], group["pp_beta"])
             updated[:num_owned].copy_(owned)
         if num_owned < chunk_size:
             updated[num_owned:].zero_()
@@ -1013,6 +1020,7 @@ print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
+print0(f"  optimizer=aurora, pp_iterations={AURORA_PP_ITERATIONS}, pp_beta={AURORA_PP_BETA}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
